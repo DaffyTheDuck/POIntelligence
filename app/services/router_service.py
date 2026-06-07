@@ -46,7 +46,7 @@ from app.providers.base import (
     ALL_EXTRACTABLE_FIELDS,
 )
 from app.providers.ollama_provider import OllamaProvider
-from app.providers.claude_provider import ClaudeProvider
+from app.providers.groq_provider import GroqProvider
 from app.services.ocr_service import OCRDocument
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 # Document quality score below which we skip Ollama and go straight to Claude.
 # Rationale: if surya is averaging <0.6 confidence, the scan is too degraded
 # for phi3.5-vision to handle reliably. Don't waste time on a doomed inference.
-_QUALITY_THRESHOLD_FOR_LOCAL = 0.60
+_QUALITY_THRESHOLD_FOR_LOCAL = 0.99
 
 # Health check cache TTL — 30s balances freshness vs latency.
 # A crashed Ollama will be detected within 30s. An HTTP health check takes ~300ms.
@@ -109,7 +109,7 @@ class RouterService:
         claude_provider: Optional[BaseProvider] = None,
     ) -> None:
         self._ollama: BaseProvider = ollama_provider or OllamaProvider()
-        self._claude: BaseProvider = claude_provider or ClaudeProvider()
+        self._claude: BaseProvider = claude_provider or GroqProvider()
         self._settings = get_settings()
 
         # Health check cache: provider_name → (is_healthy, checked_at_unix_timestamp)
@@ -144,8 +144,7 @@ class RouterService:
         if not ollama_ok and not claude_ok:
             raise RuntimeError(
                 "Both providers are unavailable. "
-                "Check that Ollama is running on the Linux machine and "
-                "that ANTHROPIC_API_KEY is valid."
+                "Check that Ollama is running and that GROQ_API_KEY is set in .env."
             )
 
         # Step 3: Select primary provider (architecture decision #2 — auto-routed)
@@ -305,6 +304,12 @@ class RouterService:
         The quality threshold is the key mechanism — if surya is averaging
         low confidence, we don't waste GPU time on a doomed Ollama inference.
         """
+
+        if claude_ok:
+            logger.debug("Using Groq as primary (Ollama disabled due to timeout issues)")
+            return self._claude
+        return self._ollama
+
         if not ollama_ok:
             logger.debug("Selecting Claude as primary: Ollama unavailable.")
             return self._claude
@@ -536,8 +541,8 @@ class RouterService:
 
     @staticmethod
     def _build_provider_input(
-        ocr_doc: OCRDocument,
-        target_fields: Optional[List[str]],
+            ocr_doc: OCRDocument,
+            target_fields: list[str] | None,
     ) -> ProviderInput:
         """Construct a ProviderInput from an OCRDocument."""
         image_bytes, image_mime_type = ocr_doc.primary_image

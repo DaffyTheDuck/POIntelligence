@@ -192,6 +192,25 @@ class DocumentService:
             result.result_id, document_id, result.overall_confidence,
         )
 
+        # Step 5: Create a JobRecord so this upload appears in the jobs list
+        # Import inside function to avoid circular imports
+        try:
+            from app.services.email_service import job_store
+            from app.models.po_models import JobRecord, JobStatus
+            from datetime import datetime, timezone
+            upload_job = JobRecord(
+                job_id=str(uuid4()),
+                document_id=document_id,
+                status=JobStatus.COMPLETE,
+                filename=filename,
+                source_email="upload",   # sentinel — not from email
+                result=result,
+                completed_at=datetime.now(timezone.utc),
+            )
+            job_store.save(upload_job)
+        except Exception as e:
+            logger.warning("Could not register upload in job store: %s", e)
+
         return result
 
     # ------------------------------------------------------------------

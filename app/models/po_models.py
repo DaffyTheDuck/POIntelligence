@@ -14,7 +14,7 @@ Design principles:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -51,9 +51,10 @@ class ModelSource(str, Enum):
     Which model produced a given field value.
     Tracked per-field so the audit trail is granular, not document-level.
     """
-    LOCAL = "local"       # phi3.5-vision via Ollama on Linux GPU machine
-    CLAUDE = "claude"     # Claude API (confidence-based fallback, decision #3)
-    HUMAN = "human"       # Human correction applied (decision #5)
+    LOCAL  = "local"   # llava-phi3 via Ollama on Linux GPU machine
+    CLAUDE = "claude"  # Claude API (kept for backward compatibility)
+    GROQ   = "groq"    # Groq API (confidence-based fallback, decision #3)
+    HUMAN  = "human"   # Human correction applied (decision #5)
 
 
 class OCRMatchMethod(str, Enum):
@@ -397,8 +398,8 @@ class JobRecord(BaseModel):
         description="Email subject line, useful for debugging"
     )
     filename: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: Optional[datetime] = None
     error_message: Optional[str] = Field(
         default=None,
@@ -464,7 +465,7 @@ class HumanCorrection(BaseModel):
 
     # Audit
     reviewer_id: str = Field(..., description="Opaque ID of the human who made this correction")
-    corrected_at: datetime = Field(default_factory=datetime.utcnow)
+    corrected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     notes: Optional[str] = Field(
         default=None,
         description="Optional reviewer comment explaining the correction"
@@ -556,7 +557,7 @@ class WebhookPayload(BaseModel):
     Loose coupling: if the ERP changes, only the webhook URL config changes.
     """
     event: str = Field(default="po.extracted", description="Event type for the receiving system")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     result_id: str
     document_id: str
     po_data: POData

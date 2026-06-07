@@ -12,6 +12,9 @@ Start Celery worker separately:
 
 from __future__ import annotations
 
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import asyncio
 import logging
 import logging.config
@@ -110,7 +113,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info('=' * 60)
     logger.info('PO Intelligence %s starting', _settings.app_version)
     logger.info('  Ollama:     %s  model=%s', _settings.ollama_base_url, _settings.ollama_model)
-    logger.info('  Claude:     model=%s', _settings.claude_model)
+    logger.info('  Groq:       model=%s', _settings.groq_model)
     logger.info('  Redis:      %s', _settings.redis_url)
     logger.info('  Threshold:  %.2f', _settings.confidence_threshold)
     logger.info('  IMAP:       %s', 'enabled' if _settings.imap_enabled else 'disabled')

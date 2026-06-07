@@ -522,7 +522,7 @@ def _within_tolerance(a: float, b: float) -> bool:
     return diff <= tolerance
 
 
-def _parse_date(date_str: Optional[str]) -> Optional[date]:
+def _parse_date(date_str: str | None) -> Optional[date]:
     """
     Parse an ISO 8601 date string to a date object.
     Returns None if the string is None, empty, or unparseable.

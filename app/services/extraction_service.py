@@ -118,6 +118,15 @@ class ExtractionService:
             ocr_doc,
         )
 
+        # ── Stage 3b: Attach bboxes for individual line items ────────────
+        # The 'line_items' field is an array — no single bbox covers it.
+        # Find each item's description in the OCR text and create individual
+        # field paths (line_items.0.description, line_items.1.description, ...)
+        # so the frontend can highlight each product row in the document.
+        field_extractions = await self._attach_line_item_bboxes(
+            field_extractions, ocr_doc
+        )
+
         # ── Stage 4: Map flat fields → nested POData ────────────────────
         po_data, mapping_warnings = self._build_po_data(field_extractions)
         for warning in mapping_warnings:
@@ -154,6 +163,77 @@ class ExtractionService:
         )
 
         return result
+
+    async def _attach_line_item_bboxes(
+        self,
+        field_extractions: Dict[str, FieldExtraction],
+        ocr_doc: OCRDocument,
+    ) -> Dict[str, FieldExtraction]:
+        """
+        Find bboxes for individual line item descriptions.
+
+        Creates field paths like 'line_items.0.description', 'line_items.1.description'
+        so DocumentViewer can highlight each product row in the document.
+
+        Only matches descriptions (the most visually distinctive per-row value).
+        Quantities and prices are typically too short/ambiguous to match reliably.
+        """
+        from app.models.po_models import ModelSource
+
+        all_lines = ocr_doc.all_text_lines
+        if not all_lines:
+            return field_extractions
+
+        # Get source model from the line_items field if available
+        source = (
+            field_extractions.get('line_items', FieldExtraction(
+                field_name='line_items', value=None,
+                confidence=0.9, source_model=ModelSource.GROQ,
+            )).source_model
+        )
+
+        # Parse line items from the already-extracted field
+        line_items_ext = field_extractions.get('line_items')
+        if not line_items_ext or not isinstance(line_items_ext.value, list):
+            return field_extractions
+
+        for i, item in enumerate(line_items_ext.value):
+            description = None
+            if isinstance(item, dict):
+                description = item.get('description')
+            elif hasattr(item, 'description'):
+                description = item.description
+
+            if not description or len(str(description).strip()) < 3:
+                continue
+
+            desc_str = str(description).strip()
+            field_path = f'line_items.{i}.description'
+
+            # Try bbox matching — same three layers as main fields
+            bbox, method = self._ocr._resolve_bounding_box(desc_str, all_lines)
+
+            if bbox is None:
+                # Layer 3 — LLM spatial hint
+                bbox, method = await self._ocr._llm_spatial_hint(
+                    field_path, desc_str, all_lines
+                )
+
+            if bbox:
+                field_extractions[field_path] = FieldExtraction(
+                    field_name=field_path,
+                    value=desc_str,
+                    confidence=0.92,
+                    source_model=source,
+                    bounding_box=bbox.model_copy(update={'ocr_match_method': method}),
+                    flagged_for_review=False,
+                )
+                logger.debug(
+                    "Line item %d bbox: '%s' → %s",
+                    i, desc_str[:30], method.value,
+                )
+
+        return field_extractions
 
     # ------------------------------------------------------------------
     # Stage 4: Flat field dict → nested POData

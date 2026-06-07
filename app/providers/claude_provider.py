@@ -98,8 +98,8 @@ class ClaudeProvider(BaseProvider):
         self,
         prompt: str,
         image_bytes: Optional[bytes],
-        image_mime_type: Optional[str],
-    ) -> tuple[str, Optional[int], Optional[int]]:
+        image_mime_type: str | None,
+    ) -> tuple[str, int | None, int | None]:
         """
         POST to Anthropic /v1/messages and return (response_text, input_tokens, output_tokens).
 
@@ -323,7 +323,7 @@ class ClaudeProvider(BaseProvider):
     def _build_content_blocks(
         prompt: str,
         image_bytes: Optional[bytes],
-        image_mime_type: Optional[str],
+        image_mime_type: str | None,
     ) -> list:
         """
         Build the Anthropic Messages API content array.

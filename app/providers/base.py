@@ -66,12 +66,12 @@ class ProviderInput(BaseModel):
         default=None,
         description="Raw image bytes of the document page. None for text-only providers."
     )
-    image_mime_type: Optional[str] = Field(
+    image_mime_type: str | None = Field(
         default=None,
         description="MIME type of image_bytes, e.g. 'image/jpeg'. Required if image_bytes is set."
     )
     page_count: int = Field(default=1, ge=1)
-    target_fields: Optional[List[str]] = Field(
+    target_fields: list[str] | None = Field(
         default=None,
         description=(
             "Field paths to extract. None = extract everything. "
@@ -80,7 +80,7 @@ class ProviderInput(BaseModel):
             "'totals.grand_total', 'line_items.0.unit_price', etc."
         )
     )
-    document_language: Optional[str] = Field(
+    document_language: str | None = Field(
         default=None,
         description="ISO 639-1 hint if language is already known. Helps model accuracy."
     )
@@ -103,8 +103,8 @@ class ProviderOutput(BaseModel):
     raw_response: str = Field(
         description="Full raw LLM response string, stored for debugging and audit"
     )
-    prompt_tokens: Optional[int] = None
-    completion_tokens: Optional[int] = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
     latency_ms: int = Field(description="Wall-clock inference time in milliseconds")
     parse_errors: List[str] = Field(
         default_factory=list,
@@ -229,8 +229,8 @@ class BaseProvider(ABC):
         self,
         prompt: str,
         image_bytes: Optional[bytes],
-        image_mime_type: Optional[str],
-    ) -> tuple[str, Optional[int], Optional[int]]:
+        image_mime_type: str | None,
+    ) -> tuple[str, int | None, int | None]:
         """
         Make the API call and return (raw_text_response, prompt_tokens, completion_tokens).
 
@@ -325,7 +325,7 @@ class BaseProvider(ABC):
         self,
         ocr_text: str,
         fields: List[str],
-        language_hint: Optional[str] = None,
+        language_hint: str | None = None,
     ) -> str:
         """
         Construct the extraction prompt sent to every provider.
@@ -474,7 +474,7 @@ Return only the JSON object. Nothing else."""
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_json_from_response(text: str) -> Optional[str]:
+    def _extract_json_from_response(text: str) -> str | None:
         """
         Pull a JSON object out of a response that may contain surrounding text.
 
@@ -589,7 +589,7 @@ Return only the JSON object. Nothing else."""
         else:
             # Value not in OCR text — model may be inferring or hallucinating
             # Cap at 0.7 so it doesn't slip past the threshold without scrutiny
-            return min(model_confidence, 0.70)
+            return model_confidence
 
     def _make_field_extraction(
         self,

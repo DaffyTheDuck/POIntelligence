@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -146,76 +147,94 @@ class OCRDocument:
 
 class _SuryaModels:
     """
-    Lazy singleton container for surya's detection and recognition models.
+    Lazy singleton container for surya 0.17.x predictors.
 
-    Loading surya models takes ~10s and consumes ~600MB VRAM.
-    They must be loaded exactly once and reused. The asyncio.Lock ensures
-    that concurrent Celery tasks don't race to initialise GPU memory.
+    surya 0.17.x replaced the old 4-object model API with three predictor classes:
+      FoundationPredictor  — shared backbone used by RecognitionPredictor
+      DetectionPredictor   — finds text regions (bounding boxes)
+      RecognitionPredictor — reads text within detected regions
 
-    Device selection:
-      "cuda" on Linux GPU machine (from config SURYA_DEVICE=cuda)
-      "cpu"  on Windows dev machine (from config SURYA_DEVICE=cpu)
-      CPU inference is ~20× slower but works for development without a GPU.
+    Loading takes ~10-15s and consumes ~600MB VRAM on the GTX 1650.
+    Must be loaded exactly once and reused across all requests.
+
+    Lock choice: threading.Lock (not asyncio.Lock) so the same singleton
+    works safely in both async FastAPI requests and synchronous Celery tasks.
+    asyncio.Lock is bound to one event loop — Celery tasks create their own
+    loops via asyncio.run(), which would deadlock on an asyncio.Lock.
     """
 
     def __init__(self) -> None:
-        self._det_model = None
-        self._det_processor = None
-        self._rec_model = None
-        self._rec_processor = None
+        self._foundation = None
+        self._det_predictor = None
+        self._rec_predictor = None
         self._loaded = False
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()  # thread-safe, works in asyncio + Celery
 
     async def ensure_loaded(self) -> None:
+        """Async entry point — delegates blocking load to thread pool."""
         if self._loaded:
             return
-        async with self._lock:
-            if self._loaded:  # Double-check after acquiring lock
+        await asyncio.get_running_loop().run_in_executor(
+            None, self._ensure_loaded_sync
+        )
+
+    def _ensure_loaded_sync(self) -> None:
+        """Thread-safe blocking load — called from thread pool."""
+        with self._lock:
+            if self._loaded:  # double-check after acquiring lock
                 return
-            await asyncio.get_event_loop().run_in_executor(None, self._load_sync)
+            self._load_sync()
             self._loaded = True
 
     def _load_sync(self) -> None:
-        """Blocking model load — run in thread pool via run_in_executor."""
+        """
+        Instantiate all three surya 0.17.x predictors.
+
+        surya 0.17.x API (from surya/scripts/ocr_text.py):
+            foundation = FoundationPredictor()
+            det        = DetectionPredictor(device=device)
+            rec        = RecognitionPredictor(foundation)
+            results    = rec([image], task_names=[TaskNames.ocr_with_boxes],
+                             det_predictor=det, math_mode=False)
+
+        DetectionPredictor accepts a device kwarg.
+        FoundationPredictor uses the default device (auto-detects CUDA).
+        RecognitionPredictor delegates device to its foundation.
+        """
         settings = get_settings()
         device = settings.surya_device
 
-        logger.info("Loading surya models on device='%s'. This takes ~10s...", device)
+        logger.info(
+            "Loading surya 0.17.x predictors on device='%s'. This takes ~15s...",
+            device,
+        )
         try:
-            from surya.model.detection.segformer import (  # type: ignore[import]
-                load_model as load_det_model,
-                load_processor as load_det_processor,
-            )
-            from surya.model.recognition.model import (  # type: ignore[import]
-                load_model as load_rec_model,
-            )
-            from surya.model.recognition.processor import (  # type: ignore[import]
-                load_processor as load_rec_processor,
-            )
+            from surya.foundation import FoundationPredictor   # type: ignore[import]
+            from surya.detection import DetectionPredictor     # type: ignore[import]
+            from surya.recognition import RecognitionPredictor # type: ignore[import]
 
-            self._det_processor = load_det_processor()
-            self._det_model = load_det_model(device=device)
-            self._rec_processor = load_rec_processor()
-            self._rec_model = load_rec_model(device=device)
+            self._foundation     = FoundationPredictor()
+            self._det_predictor  = DetectionPredictor(device=device)
+            self._rec_predictor  = RecognitionPredictor(self._foundation)
 
-            logger.info("surya models loaded successfully on device='%s'.", device)
-        except ImportError:
+            logger.info(
+                "surya predictors loaded successfully on device='%s'.", device
+            )
+        except ImportError as e:
             logger.error(
-                "surya is not installed. Install with: pip install surya-ocr. "
-                "OCR will fall back to embedded PDF text extraction only."
+                "surya import failed: %s. "
+                "Install with: pip install surya-ocr. "
+                "OCR will fall back to embedded PDF text extraction only.",
+                e,
             )
 
     @property
     def ready(self) -> bool:
-        return self._loaded and self._det_model is not None
+        return self._loaded and self._rec_predictor is not None
 
-    def get_models(self):
-        return (
-            self._det_model,
-            self._det_processor,
-            self._rec_model,
-            self._rec_processor,
-        )
+    def get_predictors(self):
+        """Return (det_predictor, rec_predictor) — used by _run_surya_on_image."""
+        return self._det_predictor, self._rec_predictor
 
 
 # Module-level singleton — shared across all OCRService instances
@@ -278,7 +297,7 @@ class OCRService:
 
     async def _process_pdf(self, path: Path, document_id: str) -> OCRDocument:
         """Convert PDF pages to OCRPage objects."""
-        pages = await asyncio.get_event_loop().run_in_executor(
+        pages = await asyncio.get_running_loop().run_in_executor(
             None, self._process_pdf_sync, path, document_id
         )
         return OCRDocument(
@@ -288,7 +307,21 @@ class OCRService:
         )
 
     def _process_pdf_sync(self, path: Path, document_id: str) -> List[OCRPage]:
-        """Blocking PDF processing — runs in thread pool."""
+        """
+        Blocking PDF processing — runs in thread pool.
+
+        Two paths:
+          Digital PDF (embedded text layer):
+            → Extract text + bboxes directly from PyMuPDF.
+            → More accurate than surya: exact coordinates from the PDF spec,
+              not a visual approximation. OCR confidence = 1.0 (ground truth).
+            → surya NOT called — avoids VRAM contention with Ollama.
+
+          Scanned PDF (no text layer / sparse text):
+            → Rasterise and run surya OCR.
+            → surya's detector has issues with some document styles — falls
+              back to empty TextLines if detection returns 0 regions.
+        """
         try:
             import fitz  # type: ignore[import]  # PyMuPDF
         except ImportError:
@@ -296,6 +329,7 @@ class OCRService:
                 "PyMuPDF is not installed. Install with: pip install pymupdf"
             )
 
+        render_dpi = 150.0
         doc = fitz.open(str(path))
         pages: List[OCRPage] = []
 
@@ -303,14 +337,20 @@ class OCRService:
             fitz_page = doc[page_idx]
             page_number = page_idx + 1
 
-            # Rasterise to PNG at 150 DPI — readable for vision model, manageable size
-            mat = fitz.Matrix(150 / 72, 150 / 72)  # 72 DPI default → 150 DPI
+            # Rasterise to PNG at 150 DPI — sent to vision model
+            mat = fitz.Matrix(render_dpi / 72, render_dpi / 72)
             pix = fitz_page.get_pixmap(matrix=mat, alpha=False)
             image_bytes = pix.tobytes("png")
 
-            # Try embedded text first (fast path)
+            # Save page 1 rasterized PNG so the frontend can display it
+            # with bounding box overlays (iframes can't have div overlays)
+            if page_idx == 0:
+                png_path = path.parent / "page_1.png"
+                png_path.write_bytes(image_bytes)
+                logger.debug("Saved rasterized PNG for frontend: %s", png_path)
+
             embedded_text = fitz_page.get_text("text").strip()
-            is_dense_enough = len(embedded_text) > 50  # Heuristic: scanned pages have <50 chars
+            is_dense_enough = len(embedded_text) > 50
 
             ocr_page = OCRPage(
                 page_number=page_number,
@@ -319,19 +359,22 @@ class OCRService:
             )
 
             if is_dense_enough:
-                logger.debug(
-                    "Page %d: using embedded text (%d chars)", page_number, len(embedded_text)
-                )
+                # Digital PDF — use PyMuPDF text layer for both text and bboxes.
+                # PyMuPDF gives us word/line positions in PDF points (72 DPI).
+                # Scale by render_dpi/72 to match rasterized image pixel coordinates.
                 ocr_page.embedded_text = embedded_text
-                # Still run surya for bounding boxes — we need coordinates even when
-                # we have clean text. The text itself comes from the PDF layer,
-                # but the TextLine bboxes come from surya's layout detection.
-                ocr_page.text_lines = self._run_surya_on_image(image_bytes, page_number)
-            else:
+                ocr_page.text_lines = self._extract_lines_from_pdf_page(
+                    fitz_page, page_number, render_dpi=render_dpi
+                )
                 logger.debug(
-                    "Page %d: sparse embedded text (%d chars), running surya OCR",
-                    page_number,
-                    len(embedded_text),
+                    "Page %d: PyMuPDF bboxes — %d lines extracted from embedded text",
+                    page_number, len(ocr_page.text_lines),
+                )
+            else:
+                # Scanned PDF — fall back to surya
+                logger.debug(
+                    "Page %d: sparse text (%d chars) — running surya OCR",
+                    page_number, len(embedded_text),
                 )
                 ocr_page.text_lines = self._run_surya_on_image(image_bytes, page_number)
 
@@ -340,13 +383,88 @@ class OCRService:
         doc.close()
         return pages
 
+    @staticmethod
+    def _extract_lines_from_pdf_page(
+        fitz_page,
+        page_number: int,
+        render_dpi: float = 150.0,
+    ) -> List[TextLine]:
+        """
+        Extract text with precise bboxes from a PyMuPDF page.
+
+        Two levels of extraction for maximum matching coverage:
+
+        1. Word-level (primary): each word gets its own tight bbox.
+           Fixes the "stacked on top of each other" problem from block
+           splitting — words at the same Y but different X don't overlap.
+
+        2. Line-level (secondary): adjacent words on the same Y are grouped
+           into compound TextLines. Enables matching multi-word values like
+           "Roland Mendel" or "Acme Corporation" as a single bbox.
+
+        Uses get_text('rawdict') which gives precise character-level positions
+        baked into line and word objects — more accurate than block splitting.
+        """
+        scale = render_dpi / 72.0
+        text_lines: List[TextLine] = []
+        seen_texts: set = set()  # avoid duplicate TextLines
+
+        def add_line(text: str, x0, y0, x1, y1):
+            text = text.strip()
+            if not text:
+                return
+            key = f"{text}:{round(x0)}:{round(y0)}"
+            if key in seen_texts:
+                return
+            seen_texts.add(key)
+            text_lines.append(TextLine(
+                text=text,
+                x0=x0 * scale, y0=y0 * scale,
+                x1=x1 * scale, y1=y1 * scale,
+                page=page_number,
+                ocr_confidence=1.0,
+            ))
+
+        # ── Word-level extraction ────────────────────────────────────────
+        words = fitz_page.get_text('words')
+        # words: (x0, y0, x1, y1, text, block_no, line_no, word_no)
+        for w in words:
+            add_line(w[4], w[0], w[1], w[2], w[3])
+
+        # ── Line-level extraction via dict ───────────────────────────────
+        # Groups adjacent words on the same physical line into compound TextLines
+        # so multi-word values ("Roland Mendel") can be matched as one bbox
+        try:
+            page_dict = fitz_page.get_text('dict')
+            for block in page_dict.get('blocks', []):
+                if block.get('type') != 0:  # 0 = text
+                    continue
+                for line in block.get('lines', []):
+                    # Concatenate all spans in this line
+                    line_text = ' '.join(
+                        span.get('text', '') for span in line.get('spans', [])
+                    ).strip()
+                    if not line_text:
+                        continue
+                    bbox = line.get('bbox')
+                    if bbox and len(bbox) == 4:
+                        add_line(line_text, bbox[0], bbox[1], bbox[2], bbox[3])
+        except Exception as e:
+            logger.debug("Line-level PDF extraction failed: %s", e)
+
+        logger.debug(
+            "PyMuPDF bboxes: page %d → %d text elements",
+            page_number, len(text_lines),
+        )
+        return text_lines
+
     async def _process_image(
         self, path: Path, document_id: str, mime_type: str
     ) -> OCRDocument:
         """Process a single image file."""
         image_bytes = path.read_bytes()
 
-        text_lines = await asyncio.get_event_loop().run_in_executor(
+        text_lines = await asyncio.get_running_loop().run_in_executor(
             None, self._run_surya_on_image, image_bytes, 1
         )
 
@@ -368,88 +486,146 @@ class OCRService:
         """
         Run surya OCR on one page image and return TextLine objects.
 
-        Called from a thread pool (not on the event loop) because surya
-        is CPU/GPU-bound synchronous code.
+        Two strategies:
+          1. Detection-based (preferred): run det_predictor to find text regions,
+             then run recognition on those regions. More accurate bboxes.
+             Falls back to strips if detector returns 0 regions (known issue
+             with some document styles).
 
-        If surya models aren't loaded yet, logs a warning and returns empty.
-        The pipeline degrades gracefully — extraction still works using
-        embedded PDF text, just without bounding boxes from surya.
+          2. Strip-based fallback: divide the image into horizontal strips,
+             pass each as a bbox to recognition — bypasses the broken detector.
+             Used for scanned documents where detection fails.
+             Bboxes are approximate (strip-level) but good enough for matching.
         """
         if not _surya_models.ready:
             logger.warning(
-                "surya models not loaded — skipping OCR for page %d. "
-                "Call await ocr_service.warm_up() at startup to pre-load models.",
+                "surya predictors not loaded — skipping OCR for page %d.",
                 page_number,
             )
             return []
 
         try:
             import io
-            from PIL import Image  # type: ignore[import]
-            from surya.ocr import run_ocr  # type: ignore[import]
+            from PIL import Image                              # type: ignore[import]
+            from surya.common.surya.schema import TaskNames   # type: ignore[import]
 
             pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            det_model, det_processor, rec_model, rec_processor = _surya_models.get_models()
+            det_predictor, rec_predictor = _surya_models.get_predictors()
 
-            # run_ocr returns List[OCRResult], one per image
-            results = run_ocr(
+            # ── Strategy 1: detection-based ──────────────────────────────
+            results = rec_predictor(
                 [pil_image],
-                [["en"]],  # Language hints — "en" covers most POs; extend if needed
-                det_model,
-                det_processor,
-                rec_model,
-                rec_processor,
+                task_names=[TaskNames.ocr_with_boxes],
+                det_predictor=det_predictor,
+                math_mode=False,
             )
 
-            if not results:
-                return []
+            if results and len(results[0].text_lines) > 0:
+                text_lines = self._parse_surya_text_lines(
+                    results[0].text_lines, page_number
+                )
+                logger.debug(
+                    "surya OCR (detection): page %d → %d text lines",
+                    page_number, len(text_lines),
+                )
+                return text_lines
 
-            text_lines: List[TextLine] = []
-            for surya_line in results[0].text_lines:
-                bbox = self._extract_bbox(surya_line)
-                if bbox is None:
-                    continue
-                text_lines.append(TextLine(
-                    text=surya_line.text,
-                    x0=bbox[0],
-                    y0=bbox[1],
-                    x1=bbox[2],
-                    y1=bbox[3],
-                    page=page_number,
-                    ocr_confidence=getattr(surya_line, "confidence", 1.0),
-                ))
-
-            logger.debug(
-                "surya OCR: page %d → %d text lines detected",
-                page_number, len(text_lines)
+            # ── Strategy 2: strip-based fallback ─────────────────────────
+            logger.info(
+                "surya detector found 0 regions on page %d — "
+                "falling back to horizontal strip OCR (scanned document).",
+                page_number,
             )
-            return text_lines
+            return self._run_surya_strips(
+                pil_image, rec_predictor, page_number
+            )
 
         except Exception as e:
-            logger.error("surya OCR failed on page %d: %s", page_number, e)
+            logger.error(
+                "surya OCR failed on page %d: %s", page_number, e, exc_info=True
+            )
             return []
 
+    def _run_surya_strips(
+        self,
+        pil_image,
+        rec_predictor,
+        page_number: int,
+        strip_height: int = 80,
+    ) -> List[TextLine]:
+        """
+        OCR a scanned image by passing horizontal strips as bboxes.
+
+        Bypasses surya's detection model (which fails on many scanned documents)
+        by manually specifying regions. Each strip is a horizontal band across
+        the full image width.
+
+        strip_height=80px at 150 DPI covers roughly 1-2 lines of typical
+        PO text. Adjust lower (50px) for dense documents, higher (100px) for
+        sparse ones.
+
+        The resulting TextLine bboxes are strip-level approximations —
+        not pixel-perfect, but accurate enough for the fuzzy matching in
+        attach_bounding_boxes to find the right region.
+        """
+        from surya.common.surya.schema import TaskNames  # type: ignore[import]
+
+        w, h = pil_image.size
+
+        # Build horizontal strip bboxes covering the full page
+        strips = [
+            [0, y, w, min(y + strip_height, h)]
+            for y in range(0, h, strip_height)
+        ]
+
+        try:
+            results = rec_predictor(
+                [pil_image],
+                task_names=[TaskNames.ocr_with_boxes],
+                bboxes=[strips],   # ← bypass detection, provide regions manually
+                math_mode=False,
+            )
+        except Exception as e:
+            logger.error("Strip OCR failed: %s", e, exc_info=True)
+            return []
+
+        if not results:
+            return []
+
+        text_lines = self._parse_surya_text_lines(
+            results[0].text_lines, page_number
+        )
+
+        logger.debug(
+            "surya OCR (strips): page %d → %d strips → %d text lines",
+            page_number, len(strips), len(text_lines),
+        )
+        return text_lines
+
     @staticmethod
-    def _extract_bbox(surya_line) -> Optional[Tuple[float, float, float, float]]:
+    def _parse_surya_text_lines(surya_lines, page_number: int) -> List[TextLine]:
         """
-        Extract (x0, y0, x1, y1) from a surya TextLine.
-
-        surya has used both 'bbox' (list) and 'polygon' (list of points) in
-        different versions. Handle both defensively.
+        Convert surya OCRResult text_lines to our TextLine dataclass.
+        Shared by both detection-based and strip-based strategies.
         """
-        # Try bbox attribute first ([x0, y0, x1, y1] or [x0, y0, x1, y1])
-        bbox = getattr(surya_line, "bbox", None)
-        if bbox and len(bbox) == 4:
-            return float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
-
-        # Try polygon attribute ([[x0,y0],[x1,y1],[x2,y2],[x3,y3]])
-        polygon = getattr(surya_line, "polygon", None)
-        if polygon and len(polygon) >= 2:
-            xs = [p[0] for p in polygon]
-            ys = [p[1] for p in polygon]
-            return min(xs), min(ys), max(xs), max(ys)
-
-        return None
+        text_lines: List[TextLine] = []
+        for surya_line in surya_lines:
+            bbox = surya_line.bbox
+            if not bbox or len(bbox) != 4:
+                continue
+            text = getattr(surya_line, "text", "").strip()
+            if not text:
+                continue
+            text_lines.append(TextLine(
+                text=text,
+                x0=float(bbox[0]),
+                y0=float(bbox[1]),
+                x1=float(bbox[2]),
+                y1=float(bbox[3]),
+                page=page_number,
+                ocr_confidence=getattr(surya_line, "confidence", 0.85),
+            ))
+        return text_lines
 
     # ------------------------------------------------------------------
     # Stage 2: Attach bounding boxes — three-layer matching
@@ -546,17 +722,51 @@ class OCRService:
         value_str: str, all_lines: List[TextLine]
     ) -> Optional[BoundingBox]:
         """
-        Return the bbox of the first text line that contains value_str as a substring,
-        or whose text is a substring of value_str (for values spanning multiple lines).
+        Find the best-matching text line for value_str.
 
-        Case-insensitive but otherwise literal.
+        Matching priority (highest wins):
+          1. Line text exactly equals value (ratio = 1.0) — e.g. "Laurence Lebihan"
+          2. Line contains value AND line is close in length to value
+             ratio = len(value) / len(line) — prefers tighter bboxes
+          3. Value contains line (value spans multiple OCR lines)
+             ratio = len(line) / len(value)
+
+        This prevents "Laurence" from winning over "Laurence Lebihan" because:
+          - "Laurence Lebihan" in "Laurence Lebihan" → ratio = 1.0 ✓
+          - "Laurence Lebihan" in "11076 2018-05-06 Laurence Lebihan" → ratio = 0.47
+          - "Laurence" in "Laurence Lebihan" → ratio = 0.53 (loses to exact match)
         """
-        value_lower = value_str.lower()
+        value_lower = value_str.lower().strip()
+        if not value_lower:
+            return None
+
+        best_line: Optional[TextLine] = None
+        best_ratio: float = 0.0
+
         for line in all_lines:
-            line_lower = line.text.lower()
-            if value_lower in line_lower or line_lower in value_lower:
+            line_lower = line.text.lower().strip()
+            if not line_lower:
+                continue
+
+            # Exact match — highest priority
+            if line_lower == value_lower:
                 return line.to_bounding_box(OCRMatchMethod.EXACT)
-        return None
+
+            # Line contains value — ratio = how much of the line is the value
+            if value_lower in line_lower:
+                ratio = len(value_lower) / len(line_lower)
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_line = line
+
+            # Value contains line — for multi-word values split across OCR lines
+            elif line_lower in value_lower and len(line_lower) > 2:
+                ratio = len(line_lower) / len(value_lower)
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_line = line
+
+        return best_line.to_bounding_box(OCRMatchMethod.EXACT) if best_line else None
 
     # ------------------------------------------------------------------
     # Layer 2 — Fuzzy normalised match

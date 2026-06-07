@@ -93,8 +93,8 @@ class OllamaProvider(BaseProvider):
         self,
         prompt: str,
         image_bytes: Optional[bytes],
-        image_mime_type: Optional[str],
-    ) -> tuple[str, Optional[int], Optional[int]]:
+        image_mime_type: str | None,
+    ) -> tuple[str, int | None, int | None]:
         """
         POST to Ollama /api/chat and return (response_text, prompt_tokens, completion_tokens).
 
@@ -269,7 +269,7 @@ class OllamaProvider(BaseProvider):
         self,
         prompt: str,
         image_bytes: Optional[bytes],
-        image_mime_type: Optional[str],
+        image_mime_type: str | None,
     ) -> dict:
         """
         Build the Ollama chat message dict.
@@ -297,7 +297,7 @@ class OllamaProvider(BaseProvider):
     @staticmethod
     def _resize_image(
         image_bytes: bytes,
-        mime_type: Optional[str],
+        mime_type: str | None,
     ) -> bytes:
         """
         Resize image so its longest edge is at most _MAX_IMAGE_DIMENSION pixels.
@@ -363,7 +363,7 @@ class OllamaProvider(BaseProvider):
 # ---------------------------------------------------------------------------
 
 
-def _mime_to_pil_format(mime_type: Optional[str]) -> Optional[str]:
+def _mime_to_pil_format(mime_type: str | None) -> str | None:
     """Map MIME type string to PIL format identifier."""
     if mime_type is None:
         return None

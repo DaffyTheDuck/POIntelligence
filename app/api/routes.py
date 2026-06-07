@@ -40,7 +40,7 @@ from app.models.po_models import (
     JobStatusResponse,
     UploadResponse,
 )
-from app.providers.claude_provider import ClaudeProvider
+from app.providers.groq_provider import GroqProvider
 from app.providers.ollama_provider import OllamaProvider
 from app.services.document_service import DocumentService
 from app.services.email_service import job_store
@@ -162,9 +162,65 @@ async def upload_document(
     )
 
 
-# ===========================================================================
+@router.get(
+    "/jobs",
+    summary="List all recent documents (uploads + email ingestion)",
+    description="Returns all processed documents sorted by creation time descending. Used by the Jobs dashboard.",
+)
+async def list_jobs() -> JSONResponse:
+    """
+    Return all jobs from both upload and email ingestion paths.
+    Upload jobs have source='upload', email jobs have source='email'.
+    """
+    from app.services.email_service import job_store
+    from app.models.po_models import JobRecord
+
+    all_jobs: list[JobRecord] = []
+
+    if job_store._redis:
+        try:
+            keys = job_store._redis.keys("job:*")
+            for key in keys:
+                data = job_store._redis.get(key)
+                if data:
+                    all_jobs.append(JobRecord.model_validate_json(data))
+        except Exception as e:
+            logger.warning("Redis list failed: %s — using in-memory", e)
+
+    if not all_jobs:
+        with job_store._lock:
+            for data in job_store._fallback.values():
+                try:
+                    all_jobs.append(JobRecord.model_validate_json(data))
+                except Exception:
+                    pass
+
+    all_jobs.sort(key=lambda j: j.created_at, reverse=True)
+
+    return JSONResponse([
+        {
+            "job_id":        j.job_id,
+            "status":        j.status.value if hasattr(j.status, 'value') else j.status,
+            "filename":      j.filename or "document",
+            "source":        "upload" if j.source_email == "upload" else "email",
+            "source_email":  j.source_email if j.source_email != "upload" else None,
+            "confidence":    round(j.result.overall_confidence, 3) if j.result else None,
+            "flagged":       len(j.result.fields_flagged_for_review) if j.result else None,
+            "duration_ms":   j.result.processing_duration_ms if j.result else None,
+            "primary_model": j.result.primary_model.value if j.result else None,
+            "fallback":      j.result.fallback_triggered if j.result else None,
+            "created_at":    j.created_at.isoformat(),
+            "error":         j.error_message,
+            "result_id":     j.result.result_id if j.result else None,
+            "document_id":   j.document_id,
+        }
+        for j in all_jobs[:100]
+    ])
+
+
+# ---------------------------------------------------------------------------
 # Job status polling — async email ingestion path
-# ===========================================================================
+# ---------------------------------------------------------------------------
 
 
 @router.get(
@@ -393,7 +449,6 @@ async def trigger_webhook(
 )
 async def serve_document_file(
     document_id: str,
-    document_service: DocumentService = Depends(get_document_service),
 ) -> FileResponse:
     """
     Serve the original document for the frontend document viewer.
@@ -404,14 +459,9 @@ async def serve_document_file(
     HTTP errors:
       404 — document not found or file not on disk
     """
-    result = document_service.get_result_by_document(document_id)
-    if result is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Document '{document_id}' not found.",
-        )
-
-    # Locate the file: uploads/{document_id}/{filename}
+    # Locate the file directly from disk — no store lookup needed.
+    # The file exists on disk even if the result was from a previous session
+    # or came through the email ingestion path.
     settings = get_settings()
     upload_dir = Path(settings.upload_dir) / document_id
 
@@ -421,7 +471,20 @@ async def serve_document_file(
             detail=f"Document file not found on disk for document '{document_id}'.",
         )
 
-    # Take the first (and only) file in the document directory
+    # Serve rasterized PNG first (generated during PDF processing)
+    png_path = upload_dir / "page_1.png"
+    if png_path.exists():
+        return FileResponse(
+            path=str(png_path),
+            media_type="image/png",
+            filename="document.png",
+            headers={
+                "X-Document-ID": document_id,
+                "Cache-Control": "private, max-age=3600",
+            },
+        )
+
+    # Fall back to the original uploaded file (image uploads)
     files = [f for f in upload_dir.iterdir() if f.is_file()]
     if not files:
         raise HTTPException(
@@ -472,7 +535,7 @@ async def health_check() -> JSONResponse:
     """
     Liveness check for the extraction pipeline.
 
-    Runs health checks on both Ollama and Claude providers concurrently.
+    Runs health checks on both Ollama and Groq providers concurrently.
     Used by load balancers, monitoring, and the startup sequence.
 
     Returns:
@@ -482,17 +545,17 @@ async def health_check() -> JSONResponse:
     import asyncio
 
     ollama = OllamaProvider()
-    claude = ClaudeProvider()
+    groq   = GroqProvider()
 
-    # Run both health checks concurrently — no point waiting for one before the other
-    ollama_ok, claude_ok = await asyncio.gather(
+    # Run both health checks concurrently
+    ollama_ok, groq_ok = await asyncio.gather(
         ollama.health_check(),
-        claude.health_check(),
+        groq.health_check(),
         return_exceptions=False,
     )
 
     settings = get_settings()
-    both_down = not ollama_ok and not claude_ok
+    both_down = not ollama_ok and not groq_ok
 
     payload = {
         "status": "degraded" if both_down else "ok",
@@ -503,9 +566,9 @@ async def health_check() -> JSONResponse:
                 "model": settings.ollama_model,
                 "base_url": settings.ollama_base_url,
             },
-            "claude": {
-                "healthy": claude_ok,
-                "model": settings.claude_model,
+            "groq": {
+                "healthy": groq_ok,
+                "model": settings.groq_model,
             },
         },
         "pipeline": {

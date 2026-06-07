@@ -89,29 +89,41 @@ class Settings(BaseSettings):
     )
 
     # -----------------------------------------------------------------------
-    # Claude — confidence-based fallback (architecture decision #3)
+    # Fallback API provider — confidence-based (architecture decision #3)
+    # Active provider: Groq (free, fast, vision support)
+    # Switch provider by changing the import in router_service.py
     # -----------------------------------------------------------------------
 
-    anthropic_api_key: str = Field(
-        ...,  # Required — no default. App will not start without this.
-        description="Anthropic API key. Get from https://console.anthropic.com/settings/keys"
+    # Groq — active fallback provider
+    groq_api_key: str | None = Field(
+        default=None,
+        description="Groq API key. Get free key at console.groq.com"
+    )
+    groq_model: str = Field(
+        default="meta-llama/llama-4-scout-17b-16e-instruct",
+        description="Groq model. Must support vision. See console.groq.com/docs/models"
+    )
+
+    # Claude — kept optional in case you want to switch back
+    anthropic_api_key: str | None = Field(
+        default=None,
+        description="Anthropic API key. Optional — only needed if switching back to ClaudeProvider."
     )
     claude_model: str = Field(
         default="claude-opus-4-5",
-        description="Claude model to use as fallback. Sonnet balances quality and cost."
+        description="Claude model name. Only used if ClaudeProvider is active in router_service.py."
     )
+
+    # Shared fallback settings — apply to whichever fallback provider is active
     claude_timeout_seconds: int = Field(
         default=90,
         ge=10,
         le=300,
-        description=(
-            "Max seconds to wait for Claude. Longer than Ollama because Claude handles "
-            "complex/degraded documents that local model struggled with."
-        )
+        description="Max seconds to wait for the fallback API provider."
     )
     claude_max_tokens: int = Field(
         default=4096,
-        description="Max tokens in Claude's response. PO extraction rarely needs more than 2k."
+        description="Max tokens in fallback provider response."
     )
 
     # -----------------------------------------------------------------------
@@ -233,7 +245,7 @@ class Settings(BaseSettings):
     # IMAP email ingestion (architecture decision #1 — async path)
     # -----------------------------------------------------------------------
 
-    imap_host: Optional[str] = Field(
+    imap_host: str | None = Field(
         default=None,
         description="IMAP server hostname, e.g. imap.gmail.com"
     )
@@ -241,11 +253,11 @@ class Settings(BaseSettings):
         default=993,
         description="IMAP port. 993 = IMAPS (TLS). 143 = plain IMAP."
     )
-    imap_username: Optional[str] = Field(
+    imap_username: str | None = Field(
         default=None,
         description="Email address / IMAP login username."
     )
-    imap_password: Optional[str] = Field(
+    imap_password: str | None = Field(
         default=None,
         description="IMAP password or app-specific password (for Gmail, use an App Password)."
     )
@@ -258,7 +270,7 @@ class Settings(BaseSettings):
         ge=10,
         description="How often the email service polls for new messages."
     )
-    imap_attachment_subject_filter: Optional[str] = Field(
+    imap_attachment_subject_filter: str | None = Field(
         default=None,
         description=(
             "Optional subject line substring filter. "
@@ -278,7 +290,7 @@ class Settings(BaseSettings):
             "Files are generated locally and never uploaded to a third party — GDPR compliance."
         )
     )
-    webhook_url: Optional[str] = Field(
+    webhook_url: str | None = Field(
         default=None,
         description=(
             "ERP or downstream system webhook endpoint. "
@@ -290,7 +302,7 @@ class Settings(BaseSettings):
         default=10,
         description="Max seconds to wait for the webhook endpoint to respond."
     )
-    webhook_secret: Optional[str] = Field(
+    webhook_secret: str | None = Field(
         default=None,
         description=(
             "Optional HMAC secret for signing webhook payloads. "

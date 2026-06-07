@@ -321,7 +321,7 @@ class EmailService:
 
         while self._running:
             try:
-                await asyncio.get_event_loop().run_in_executor(
+                await asyncio.get_running_loop().run_in_executor(
                     None, self._poll_sync
                 )
             except Exception as e:

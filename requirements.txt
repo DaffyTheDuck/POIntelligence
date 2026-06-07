@@ -1,13 +1,9 @@
 # PO Intelligence — Python dependencies
 # Install: pip install -r requirements.txt
 #
-# Two-machine notes:
-#   Windows dev machine: install everything EXCEPT surya-ocr (no GPU needed for writing code)
-#   Linux GPU machine:   install everything (surya runs on CUDA)
-#
-# surya-ocr pulls PyTorch — on Linux with CUDA, install torch first:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu118
-#   pip install -r requirements.txt
+# Linux GPU machine setup order:
+#   1. pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#   2. pip install -r requirements.txt
 
 # ── Web framework ──────────────────────────────────────────────────────────
 fastapi==0.115.5
@@ -18,32 +14,30 @@ python-multipart==0.0.12       # Required by FastAPI for file upload (UploadFile
 pydantic==2.10.2
 pydantic-settings==2.6.1       # BaseSettings — reads from .env file
 
-# ── HTTP client (async) ───────────────────────────────────────────────────
-httpx==0.28.1                  # Ollama + Claude + webhook HTTP calls
+# ── HTTP clients ─────────────────────────────────────────────────────────
+httpx==0.28.1                  # Async HTTP — Ollama + Groq + webhooks
+requests==2.32.3               # Sync HTTP — required by surya-ocr internals
 
 # ── Task queue ────────────────────────────────────────────────────────────
 celery==5.4.0
 redis==5.2.1                   # Celery broker/backend + JobStore
 
 # ── OCR ───────────────────────────────────────────────────────────────────
-surya-ocr==0.6.13              # Layout detection + text recognition (GPU preferred)
-# Windows dev machine: surya works on CPU but is ~20x slower
-# Linux GPU machine:   install torch with CUDA before surya-ocr
+transformers==4.56.2
+surya-ocr==0.17.1               # Layout detection + text recognition (GPU preferred)
+# Install torch with CUDA BEFORE surya-ocr:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # ── PDF processing ────────────────────────────────────────────────────────
 pymupdf==1.24.14               # PDF → image conversion + embedded text extraction
                                # Import as: import fitz
 
 # ── Image processing ──────────────────────────────────────────────────────
-Pillow==11.0.0                 # Image resizing before Ollama vision inference
+Pillow>=10.2.0,<11.0.0         # Image resizing — surya-ocr requires <11.0.0
 
 # ── Fuzzy string matching (OCR Layer 2) ───────────────────────────────────
-rapidfuzz==3.10.1              # Layer 2 bounding box matching (faster than fuzzywuzzy)
-
-# ── Anthropic SDK (optional — we use httpx directly but useful for reference) ─
-# anthropic==0.40.0            # Uncomment if you prefer the SDK over raw httpx
+rapidfuzz==3.10.1              # Layer 2 bounding box matching
 
 # ── Development and testing ───────────────────────────────────────────────
 pytest==8.3.3
 pytest-asyncio==0.24.0         # async test support
-httpx==0.28.1                  # Also used as test client (AsyncClient)
