@@ -288,6 +288,45 @@ class ValidationFlag(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Approval record — explicit human sign-off before export
+# ---------------------------------------------------------------------------
+
+class ApprovalStatus(str, Enum):
+    PENDING  = "pending"   # awaiting reviewer action
+    APPROVED = "approved"  # reviewer signed off — export enabled
+    REJECTED = "rejected"  # reviewer rejected — needs re-processing
+
+
+class ApprovalRecord(BaseModel):
+    """
+    Explicit human approval before a document can be exported.
+
+    Separates two distinct actions:
+      - Field review: confirming individual extracted values are correct
+      - Document approval: a reviewer signs off that the whole document
+        is ready to enter the ERP / downstream system
+
+    This is important in enterprise workflows where:
+      - Multiple reviewers may handle different fields
+      - A senior approver has final sign-off authority
+      - The approval record is an audit trail entry
+    """
+    status:      ApprovalStatus = ApprovalStatus.PENDING
+    reviewer_id: Optional[str]  = Field(
+        default=None,
+        description="Reviewer identifier — username, email, or name"
+    )
+    approved_at: Optional[datetime] = Field(
+        default=None,
+        description="Timestamp of approval or rejection"
+    )
+    notes: Optional[str] = Field(
+        default=None,
+        description="Optional reviewer notes — required when rejecting"
+    )
+
+
 class ExtractionResult(BaseModel):
     """
     The complete output of one pass through the extraction pipeline.
@@ -298,6 +337,7 @@ class ExtractionResult(BaseModel):
       - field_extractions: per-field metadata dict, keyed by field name
       - overall_confidence: document-level score (min of all field scores)
       - pipeline metadata: timing, model routing decisions, flags
+      - approval: explicit reviewer sign-off record
 
     The frontend receives this full object so it can render confidence indicators,
     highlight low-confidence fields, and display bounding boxes for verification.
@@ -317,9 +357,7 @@ class ExtractionResult(BaseModel):
 
     # Document-level quality metrics
     overall_confidence: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
+        default=0.0, ge=0.0, le=1.0,
         description="Minimum confidence across all extracted fields (weakest-link score)"
     )
     fields_flagged_for_review: List[str] = Field(
@@ -331,6 +369,12 @@ class ExtractionResult(BaseModel):
         description="Business rule violations found by validation_service"
     )
 
+    # Explicit reviewer approval
+    approval: ApprovalRecord = Field(
+        default_factory=ApprovalRecord,
+        description="Human approval record — must be APPROVED before export is allowed"
+    )
+
     # Pipeline routing metadata (architecture decisions #2 and #3)
     primary_model: ModelSource = Field(
         ...,
@@ -338,31 +382,35 @@ class ExtractionResult(BaseModel):
     )
     fallback_triggered: bool = Field(
         default=False,
-        description="True if Claude was called as fallback (confidence was below threshold)"
+        description="True if Groq was called as fallback (confidence was below threshold)"
     )
     fallback_fields: List[str] = Field(
         default_factory=list,
-        description="Fields that were re-extracted by Claude after local model underperformed"
+        description="Fields that were re-extracted by Groq after local model underperformed"
     )
 
     # Timing
-    processing_started_at: Optional[datetime] = None
+    processing_started_at:   Optional[datetime] = None
     processing_completed_at: Optional[datetime] = None
-    processing_duration_ms: Optional[int] = Field(
+    processing_duration_ms:  Optional[int]      = Field(
         default=None,
         description="Wall-clock time from start to completion in milliseconds"
     )
 
     @property
+    def is_approved(self) -> bool:
+        """True when a reviewer has explicitly approved this document."""
+        return self.approval.status == ApprovalStatus.APPROVED
+
+    @property
     def is_ready_for_export(self) -> bool:
         """
-        True only when no fields require human review and no error-level validation flags.
-        Export service checks this before generating any output file.
+        True when the document has been explicitly approved by a reviewer.
+        The approval gate replaces the old flag-count check — a reviewer's
+        explicit sign-off is the single source of truth for export readiness.
+        Validation errors are surfaced to the reviewer, not a hard block.
         """
-        has_unflagged_errors = any(
-            f.severity == "error" for f in self.validation_flags
-        )
-        return not self.fields_flagged_for_review and not has_unflagged_errors
+        return self.is_approved
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +593,13 @@ class ExportRequest(BaseModel):
     include_metadata: bool = Field(
         default=False,
         description="If True, field-level confidence scores are included in the export"
+    )
+    force: bool = Field(
+        default=False,
+        description=(
+            "If True, bypass the review gate and export even if fields are still flagged. "
+            "Use when reviewer has manually verified the document is correct."
+        )
     )
 
 

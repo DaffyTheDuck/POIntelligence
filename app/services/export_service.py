@@ -68,44 +68,39 @@ class ExportService:
         self,
         result: ExtractionResult,
         request: ExportRequest,
+        force: bool = False,
     ) -> Path:
         """
         Generate an export file for the given result and return its path.
 
-        Gate: refuses to export if result.is_ready_for_export is False.
-        This enforces the human review loop — flagged documents don't leave
-        the system until a reviewer clears them.
+        Gate: refuses to export if result.is_ready_for_export is False,
+        UNLESS force=True is passed (reviewer explicitly overrides the gate).
 
         Files are written to:
           {export_dir}/{result_id}/po_export.{format}
-
-        One directory per result so multiple format exports don't collide
-        and cleanup is trivial (delete the result directory).
-
-        Raises:
-          ValueError — result not export-ready, or unsupported format.
         """
-        if not result.is_ready_for_export:
+        if not force and not result.is_ready_for_export:
             pending = result.fields_flagged_for_review
-            errors = [f for f in result.validation_flags if f.severity == "error"]
+            errors  = [f for f in result.validation_flags if f.severity == "error"]
             raise ValueError(
                 f"Result '{result.result_id}' is not ready for export. "
                 f"Pending review fields: {pending}. "
                 f"Validation errors: {[e.rule for e in errors]}. "
-                f"Resolve all flags before exporting."
+                f"Resolve all flags or use force=True to override."
             )
 
-        # Build output directory and file path
-        out_dir = self._export_dir / result.result_id
+        out_dir   = self._export_dir / result.result_id
         out_dir.mkdir(parents=True, exist_ok=True)
         file_path = out_dir / f"po_export.{request.format.value}"
 
         logger.info(
-            "Generating %s export for result %s → %s",
-            request.format.value.upper(), result.result_id, file_path,
+            "Generating %s export for result %s%s → %s",
+            request.format.value.upper(),
+            result.result_id,
+            " (forced)" if force else "",
+            file_path,
         )
 
-        # Dispatch to format-specific generator
         if request.format == ExportFormat.JSON:
             content = self._export_json(result, request.include_metadata)
         elif request.format == ExportFormat.CSV:
@@ -116,9 +111,7 @@ class ExportService:
             raise ValueError(f"Unsupported export format: {request.format}")
 
         file_path.write_bytes(content)
-        logger.info(
-            "Export written: %s (%d bytes)", file_path, len(content)
-        )
+        logger.info("Export written: %s (%d bytes)", file_path, len(content))
         return file_path
 
     # ------------------------------------------------------------------
@@ -134,34 +127,53 @@ class ExportService:
         Export as JSON.
 
         Default (include_metadata=False):
-          Clean POData only — what the ERP or downstream system needs.
+          Clean POData only — what an ERP or downstream system needs.
+          Structure matches the POData model exactly.
 
         With include_metadata=True:
           Adds a _metadata block with confidence scores and pipeline provenance.
-          Useful for debugging, auditing, or feeding a data quality dashboard.
+          Internal pseudo-paths (line_items.N.description) are filtered out.
           The leading underscore signals "not for ERP consumption."
+
+        Example clean output:
+          {
+            "po_number": "PO-2024-001",
+            "vendor": { "name": "Acme Corp", "address": "..." },
+            "line_items": [{ "description": "Widget A", "quantity": 10, ... }],
+            "totals": { "grand_total": 5400.00 }
+          }
         """
         output: dict = result.po_data.model_dump(exclude_none=True)
 
         if include_metadata:
+            # Filter out internal pseudo-paths (line_items.N.description added for bbox)
+            real_fields = {
+                path: ext
+                for path, ext in result.field_extractions.items()
+                if not path.startswith("line_items.") and ext.value is not None
+            }
+
             output["_metadata"] = {
-                "result_id": result.result_id,
-                "document_id": result.document_id,
-                "overall_confidence": result.overall_confidence,
-                "fields_flagged_for_review": result.fields_flagged_for_review,
-                "primary_model": result.primary_model.value,
-                "fallback_triggered": result.fallback_triggered,
-                "fallback_fields": result.fallback_fields,
-                "processing_duration_ms": result.processing_duration_ms,
-                "exported_at": datetime.now(timezone.utc).isoformat(),
+                "result_id":               result.result_id,
+                "document_id":             result.document_id,
+                "overall_confidence":      round(result.overall_confidence, 3),
+                "primary_model":           result.primary_model.value,
+                "fallback_triggered":      result.fallback_triggered,
+                "fallback_fields":         result.fallback_fields,
+                "processing_duration_ms":  result.processing_duration_ms,
+                "exported_at":             datetime.now(timezone.utc).isoformat(),
+                "approved":                result.is_ready_for_export,
                 "field_confidence": {
-                    path: round(ext.confidence, 3)
-                    for path, ext in result.field_extractions.items()
-                    if ext.value is not None
+                    path: {
+                        "value":      ext.value,
+                        "confidence": round(ext.confidence, 3),
+                        "source":     ext.source_model.value,
+                    }
+                    for path, ext in real_fields.items()
                 },
             }
 
-        return json.dumps(output, indent=2, ensure_ascii=False).encode("utf-8")
+        return json.dumps(output, indent=2, ensure_ascii=False, default=str).encode("utf-8")
 
     # ------------------------------------------------------------------
     # CSV export

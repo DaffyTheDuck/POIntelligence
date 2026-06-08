@@ -101,6 +101,13 @@ class ExtractionService:
             len(ocr_doc.full_text),
         )
 
+        # ── VRAM release: unload surya before LLM inference ─────────────
+        # surya holds ~600MB on the GTX 1650. Releasing it here gives Ollama
+        # room to load llava-phi3 without OOM. No-op for digital PDFs where
+        # surya was never called. Groq is unaffected (cloud, no local VRAM).
+        from app.services.ocr_service import unload_surya_models
+        unload_surya_models()
+
         # ── Stage 2: Route + Extract ────────────────────────────────────
         decision: RouterDecision = await self._router.route(ocr_doc)
         logger.info(
@@ -170,21 +177,27 @@ class ExtractionService:
         ocr_doc: OCRDocument,
     ) -> Dict[str, FieldExtraction]:
         """
-        Find bboxes for individual line item descriptions.
+        Create full row-spanning bounding boxes for each line item (Nanonets-style).
 
-        Creates field paths like 'line_items.0.description', 'line_items.1.description'
-        so DocumentViewer can highlight each product row in the document.
+        Strategy per row:
+          1. Find the description bbox — this anchors the y-position of the row.
+          2. Scan all OCR lines within 2.5x row-height of that y for matching
+             numeric fields (qty, unit_price, line_total, part_number).
+          3. Merge all found boxes into a single bbox spanning the entire row.
+          4. Add 15% vertical padding so the box looks like a row highlight.
 
-        Only matches descriptions (the most visually distinctive per-row value).
-        Quantities and prices are typically too short/ambiguous to match reliably.
+        Numeric matching normalises values — strips commas, currency symbols so
+        "$ 1,500.00" matches "1500.00" and "45" matches "45.00".
+
+        Creates paths: line_items.0, line_items.1, ... (row-level).
         """
-        from app.models.po_models import ModelSource
+        from app.models.po_models import ModelSource, BoundingBox
+        import re
 
         all_lines = ocr_doc.all_text_lines
         if not all_lines:
             return field_extractions
 
-        # Get source model from the line_items field if available
         source = (
             field_extractions.get('line_items', FieldExtraction(
                 field_name='line_items', value=None,
@@ -192,46 +205,106 @@ class ExtractionService:
             )).source_model
         )
 
-        # Parse line items from the already-extracted field
         line_items_ext = field_extractions.get('line_items')
         if not line_items_ext or not isinstance(line_items_ext.value, list):
             return field_extractions
 
+        def _norm(v: str) -> str:
+            """Strip currency/commas/spaces for loose numeric match."""
+            return re.sub(r'[,$€£\s]', '', str(v)).lstrip('0') or '0'
+
+        def _find_near_y(value_str: str, y_center: float, y_tol: float, page: int):
+            norm_val = _norm(value_str)
+            if not norm_val or norm_val in ('0', '.'):
+                return None
+            best, best_dist = None, float('inf')
+            for line in all_lines:
+                if line.page != page:
+                    continue
+                line_y = (line.y0 + line.y1) / 2
+                if abs(line_y - y_center) > y_tol:
+                    continue
+                if norm_val in _norm(line.text):
+                    dist = abs(line_y - y_center)
+                    if dist < best_dist:
+                        best_dist, best = dist, line
+            return best
+
         for i, item in enumerate(line_items_ext.value):
-            description = None
             if isinstance(item, dict):
                 description = item.get('description')
+                qty         = item.get('quantity')
+                unit_price  = item.get('unit_price')
+                line_total  = item.get('line_total')
+                part_number = item.get('part_number')
             elif hasattr(item, 'description'):
                 description = item.description
+                qty         = getattr(item, 'quantity',    None)
+                unit_price  = getattr(item, 'unit_price',  None)
+                line_total  = getattr(item, 'line_total',  None)
+                part_number = getattr(item, 'part_number', None)
+            else:
+                continue
 
-            if not description or len(str(description).strip()) < 3:
+            if not description or len(str(description).strip()) < 4:
                 continue
 
             desc_str = str(description).strip()
-            field_path = f'line_items.{i}.description'
+            row_path = f'line_items.{i}'
 
-            # Try bbox matching — same three layers as main fields
-            bbox, method = self._ocr._resolve_bounding_box(desc_str, all_lines)
+            # Step 1: description bbox as row y-anchor
+            desc_bbox, method = self._ocr._resolve_bounding_box(desc_str, all_lines)
+            if desc_bbox is None:
+                desc_bbox, method = await self._ocr._llm_spatial_hint(
+                    f'line_items.{i}.description', desc_str, all_lines
+                )
+            if desc_bbox is None:
+                continue
 
-            if bbox is None:
-                # Layer 3 — LLM spatial hint
-                bbox, method = await self._ocr._llm_spatial_hint(
-                    field_path, desc_str, all_lines
-                )
+            page       = desc_bbox.page
+            y_center   = (desc_bbox.y0 + desc_bbox.y1) / 2
+            row_height = max(desc_bbox.y1 - desc_bbox.y0, 8)
+            y_tol      = max(row_height * 2.5, 20)
 
-            if bbox:
-                field_extractions[field_path] = FieldExtraction(
-                    field_name=field_path,
-                    value=desc_str,
-                    confidence=0.92,
-                    source_model=source,
-                    bounding_box=bbox.model_copy(update={'ocr_match_method': method}),
-                    flagged_for_review=False,
-                )
-                logger.debug(
-                    "Line item %d bbox: '%s' → %s",
-                    i, desc_str[:30], method.value,
-                )
+            # Step 2: find numeric columns near the same y
+            candidate_boxes = [desc_bbox]
+            for field_val in [qty, unit_price, line_total, part_number]:
+                if field_val is None:
+                    continue
+                match_line = _find_near_y(str(field_val), y_center, y_tol, page)
+                if match_line:
+                    candidate_boxes.append(match_line.to_bounding_box(method))
+
+            # Step 3: merge into one spanning bbox
+            merged_x0 = min(b.x0 for b in candidate_boxes)
+            merged_y0 = min(b.y0 for b in candidate_boxes)
+            merged_x1 = max(b.x1 for b in candidate_boxes)
+            merged_y1 = max(b.y1 for b in candidate_boxes)
+
+            # Step 4: vertical padding (15% of row height)
+            pad = row_height * 0.15
+            row_bbox = BoundingBox(
+                x0=merged_x0,
+                y0=max(0.0, merged_y0 - pad),
+                x1=merged_x1,
+                y1=merged_y1 + pad,
+                page=page,
+                ocr_match_method=method,
+            )
+
+            field_extractions[row_path] = FieldExtraction(
+                field_name=row_path,
+                value=desc_str,
+                confidence=0.92,
+                source_model=source,
+                bounding_box=row_bbox,
+                flagged_for_review=False,
+            )
+            logger.debug(
+                "Line item %d row bbox: '%s...' → %s (%d cols, x=[%.0f, %.0f])",
+                i, desc_str[:20], method.value, len(candidate_boxes),
+                merged_x0, merged_x1,
+            )
 
         return field_extractions
 

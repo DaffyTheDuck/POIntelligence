@@ -214,11 +214,23 @@ class _SuryaModels:
             from surya.recognition import RecognitionPredictor # type: ignore[import]
 
             self._foundation     = FoundationPredictor()
-            self._det_predictor  = DetectionPredictor(device=device)
+            # detection_threshold: lower = detect more regions on scanned docs.
+            # Default in surya is ~0.35; we use 0.1 (set via SURYA_DETECTOR_THRESH).
+            # Silently ignored if the installed version doesn't accept the kwarg.
+            try:
+                self._det_predictor = DetectionPredictor(
+                    device=device,
+                    detection_threshold=settings.surya_detector_thresh,
+                )
+            except TypeError:
+                # Older surya build — no detection_threshold kwarg
+                self._det_predictor = DetectionPredictor(device=device)
             self._rec_predictor  = RecognitionPredictor(self._foundation)
 
             logger.info(
-                "surya predictors loaded successfully on device='%s'.", device
+                "surya predictors loaded successfully on device='%s' "
+                "(detector_thresh=%.2f).",
+                device, settings.surya_detector_thresh,
             )
         except ImportError as e:
             logger.error(
@@ -236,9 +248,51 @@ class _SuryaModels:
         """Return (det_predictor, rec_predictor) — used by _run_surya_on_image."""
         return self._det_predictor, self._rec_predictor
 
+    def unload(self) -> None:
+        """
+        Release surya model references and free VRAM.
+
+        Called by extraction_service between the OCR stage and the LLM inference
+        stage so that Ollama (llava-phi3) can claim the freed VRAM on the GTX 1650.
+
+        After unload(), ready=False. The next call to ensure_loaded() will reload
+        the models (adds ~15s to the first post-unload request).
+
+        Architecture decision: surya and Ollama compete for the same 4GB. We
+        run them sequentially and release memory between stages rather than
+        trying to fit both in VRAM simultaneously.
+        """
+        with self._lock:
+            self._foundation     = None
+            self._det_predictor  = None
+            self._rec_predictor  = None
+            self._loaded         = False
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info(
+                    "surya models unloaded. VRAM freed for Ollama inference. "
+                    "Freed: torch.cuda.empty_cache() called."
+                )
+        except Exception as e:
+            logger.debug("torch.cuda.empty_cache() skipped: %s", e)
+
 
 # Module-level singleton — shared across all OCRService instances
 _surya_models = _SuryaModels()
+
+
+def unload_surya_models() -> None:
+    """
+    Public helper to release surya VRAM before LLM inference.
+
+    Called from ExtractionService.extract() between Stage 1 (OCR) and
+    Stage 2 (Route + Extract) to free ~600MB for Ollama.
+
+    No-op if surya was never loaded (e.g. digital PDF took the fast path).
+    """  # noqa: D401
+    _surya_models.unload()
 
 
 # ---------------------------------------------------------------------------
@@ -461,17 +515,33 @@ class OCRService:
     async def _process_image(
         self, path: Path, document_id: str, mime_type: str
     ) -> OCRDocument:
-        """Process a single image file."""
-        image_bytes = path.read_bytes()
+        """Process a single image file (JPEG, PNG, WEBP, etc)."""
+        import io
+        from PIL import Image, ImageOps
 
+        # 1. Load and normalise image (fix smartphone EXIF rotation)
+        raw_bytes = path.read_bytes()
+        pil_image = Image.open(io.BytesIO(raw_bytes))
+        pil_image = ImageOps.exif_transpose(pil_image).convert("RGB")
+
+        # 2. Save a canonical page_1.png so frontend and surya see exact same pixels
+        out_bytes = io.BytesIO()
+        pil_image.save(out_bytes, format="PNG")
+        clean_bytes = out_bytes.getvalue()
+
+        png_path = path.parent / "page_1.png"
+        png_path.write_bytes(clean_bytes)
+        logger.debug("Saved canonical page_1.png for image upload: %s", png_path)
+
+        # 3. Run OCR on the clean bytes
         text_lines = await asyncio.get_running_loop().run_in_executor(
-            None, self._run_surya_on_image, image_bytes, 1
+            None, self._run_surya_on_image, clean_bytes, 1
         )
 
         page = OCRPage(
             page_number=1,
-            image_bytes=image_bytes,
-            image_mime_type=mime_type,
+            image_bytes=clean_bytes,
+            image_mime_type="image/png",
             text_lines=text_lines,
         )
         return OCRDocument(
@@ -700,18 +770,120 @@ class OCRService:
         """
         Run Layer 1 then Layer 2. Returns (bbox, method) or (None, UNRESOLVED).
         Layer 3 is async and handled by the caller.
+
+        For multi-line values (addresses with street + city + postcode), after
+        finding the initial match we try to expand the bbox by finding adjacent
+        OCR lines that contain the remaining parts of the value.
         """
         # Layer 1: Exact match
         bbox = self._exact_match(value_str, all_lines)
         if bbox is not None:
-            return bbox, OCRMatchMethod.EXACT
+            # Try to expand for multi-line values (e.g. full addresses)
+            expanded = self._expand_multiline_bbox(
+                value_str, bbox, all_lines, OCRMatchMethod.EXACT
+            )
+            return expanded or bbox, OCRMatchMethod.EXACT
 
         # Layer 2: Fuzzy normalised match
         bbox = self._fuzzy_match(value_str, all_lines)
         if bbox is not None:
-            return bbox, OCRMatchMethod.FUZZY
+            expanded = self._expand_multiline_bbox(
+                value_str, bbox, all_lines, OCRMatchMethod.FUZZY
+            )
+            return expanded or bbox, OCRMatchMethod.FUZZY
 
         return None, OCRMatchMethod.UNRESOLVED
+
+    @staticmethod
+    def _expand_multiline_bbox(
+        value_str: str,
+        initial_bbox: BoundingBox,
+        all_lines: List[TextLine],
+        method: OCRMatchMethod,
+        y_tolerance: float = 80.0,   # max vertical gap between lines (pixels at 150 DPI)
+        min_part_length: int = 3,    # ignore very short words (articles, etc.)
+    ) -> Optional[BoundingBox]:
+        """
+        Expand a single-line bbox to cover all lines of a multi-part value.
+
+        Used for full addresses like "1 Main Street, Townsville, DH9 OTB"
+        where the model returns the whole address but OCR has it on 3 separate lines.
+
+        Strategy:
+          1. Split the value into meaningful parts (by comma or significant words)
+          2. For each part, find its OCR line near the initial bbox's Y position
+          3. Merge all found bboxes into one spanning box
+
+        Only expands if:
+          - The value has 2+ comma-separated parts OR 5+ words
+          - All matched lines are on the same page
+          - Lines are within y_tolerance pixels of each other
+        """
+        # Only try to expand genuinely multi-line values
+        parts_by_comma = [p.strip() for p in value_str.split(',') if p.strip()]
+        word_count = len(value_str.split())
+
+        is_multiline = len(parts_by_comma) >= 2 or word_count >= 5
+        if not is_multiline:
+            return None
+
+        # Use comma parts if available, otherwise split into chunks of 2-3 words
+        if len(parts_by_comma) >= 2:
+            search_parts = parts_by_comma
+        else:
+            words = value_str.split()
+            search_parts = [
+                ' '.join(words[i:i + 3])
+                for i in range(0, len(words), 3)
+            ]
+
+        # Filter out trivially short parts
+        search_parts = [p for p in search_parts if len(p) >= min_part_length]
+        if not search_parts:
+            return None
+
+        # Find OCR lines for each part, restricted to same page and nearby Y
+        page = initial_bbox.page
+        y_anchor = initial_bbox.y0  # start searching near here
+        matched_lines: List[TextLine] = []
+
+        for part in search_parts:
+            part_lower = part.lower().strip()
+            best_line: Optional[TextLine] = None
+            best_dist: float = float('inf')
+
+            for line in all_lines:
+                if line.page != page:
+                    continue
+                if abs(line.y0 - y_anchor) > y_tolerance * len(search_parts):
+                    continue
+                if part_lower in line.text.lower() or line.text.lower() in part_lower:
+                    dist = abs(line.y0 - y_anchor)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_line = line
+
+            if best_line is not None and best_line not in matched_lines:
+                matched_lines.append(best_line)
+
+        if len(matched_lines) < 2:
+            return None  # Didn't find multiple lines — no point merging
+
+        # Sanity check: all lines within reasonable vertical range
+        min_y = min(l.y0 for l in matched_lines)
+        max_y = max(l.y1 for l in matched_lines)
+        if max_y - min_y > y_tolerance * len(search_parts):
+            return None  # Lines too spread out — probably wrong matches
+
+        # Merge into one spanning bbox
+        return BoundingBox(
+            x0=min(l.x0 for l in matched_lines),
+            y0=min_y,
+            x1=max(l.x1 for l in matched_lines),
+            y1=max_y,
+            page=page,
+            ocr_match_method=method,
+        )
 
     # ------------------------------------------------------------------
     # Layer 1 — Exact match
@@ -724,20 +896,16 @@ class OCRService:
         """
         Find the best-matching text line for value_str.
 
-        Matching priority (highest wins):
-          1. Line text exactly equals value (ratio = 1.0) — e.g. "Laurence Lebihan"
-          2. Line contains value AND line is close in length to value
-             ratio = len(value) / len(line) — prefers tighter bboxes
-          3. Value contains line (value spans multiple OCR lines)
-             ratio = len(line) / len(value)
-
-        This prevents "Laurence" from winning over "Laurence Lebihan" because:
-          - "Laurence Lebihan" in "Laurence Lebihan" → ratio = 1.0 ✓
-          - "Laurence Lebihan" in "11076 2018-05-06 Laurence Lebihan" → ratio = 0.47
-          - "Laurence" in "Laurence Lebihan" → ratio = 0.53 (loses to exact match)
+        Short values (< 5 chars) are skipped — numbers like "21", "40"
+        match too many places (product IDs, quantities, page numbers).
+        The LLM spatial hint handles short values when needed.
         """
         value_lower = value_str.lower().strip()
         if not value_lower:
+            return None
+
+        # Skip very short values — too ambiguous
+        if len(value_lower) < 5:
             return None
 
         best_line: Optional[TextLine] = None

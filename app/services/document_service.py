@@ -78,38 +78,158 @@ class _ResultStore:
     with key "result:{result_id}" and TTL matching redis_job_ttl_seconds.
     """
 
-    def __init__(self) -> None:
+    def __init__(self):
         self._by_result_id: Dict[str, ExtractionResult] = {}
-        self._by_document_id: Dict[str, str] = {}   # document_id → result_id
+        self._by_document_id: Dict[str, str] = {}
         self._corrections: List[HumanCorrection] = []
         self._lock = threading.Lock()
+
+        # Redis for persistence across restarts
+        self._redis = None
+        try:
+            import redis
+            s = get_settings()
+            self._redis = redis.from_url(s.redis_url, decode_responses=True)
+            self._redis.ping()
+            logger.info("_ResultStore connected to Redis at %s", s.redis_url)
+            # Warm the document_id → result_id secondary index from Redis
+            # so get_by_document_id() works after a restart without a full scan.
+            self._warm_document_index()
+        except Exception as e:
+            logger.warning(
+                "_ResultStore: Redis unavailable (%s). Results will be in-memory only. "
+                "Approvals will be lost on restart unless Redis is running.", e
+            )
+            self._redis = None
+
+    def _warm_document_index(self) -> None:
+        """
+        Rebuild _by_document_id from Redis docmap keys on startup.
+
+        Key pattern: docmap:{document_id} → result_id (string, not JSON)
+        This is much faster than scanning all result:* keys and parsing JSON.
+        Called once in __init__ when Redis is available.
+        """
+        if not self._redis:
+            return
+        try:
+            keys = self._redis.keys("docmap:*")
+            if not keys:
+                return
+            # Pipeline for efficiency — one round trip for N keys
+            pipe = self._redis.pipeline()
+            for key in keys:
+                pipe.get(key)
+            values = pipe.execute()
+            with self._lock:
+                for key, result_id in zip(keys, values):
+                    if result_id:
+                        doc_id = key.removeprefix("docmap:")
+                        self._by_document_id[doc_id] = result_id
+            logger.info(
+                "_ResultStore: warmed document index with %d entries from Redis.",
+                len([v for v in values if v]),
+            )
+        except Exception as e:
+            logger.warning("_ResultStore: failed to warm document index: %s", e)
+
+    def _redis_setex(self, key: str, ttl: int, value: str) -> None:
+        """Best-effort Redis write — logs warning on failure, never raises."""
+        if not self._redis:
+            return
+        try:
+            self._redis.setex(key, ttl, value)
+        except Exception as e:
+            logger.warning("_ResultStore Redis write failed for key '%s': %s", key, e)
 
     def save(self, result: ExtractionResult) -> None:
         with self._lock:
             self._by_result_id[result.result_id] = result
             self._by_document_id[result.document_id] = result.result_id
+        # Persist the full result and the document_id secondary index
+        self._redis_setex(f"result:{result.result_id}", 86400, result.model_dump_json())
+        self._redis_setex(f"docmap:{result.document_id}",  86400, result.result_id)
 
     def get_by_result_id(self, result_id: str) -> Optional[ExtractionResult]:
         with self._lock:
-            return self._by_result_id.get(result_id)
+            result = self._by_result_id.get(result_id)
+            if result:
+                return result
+        # Not in memory — check Redis (handles post-restart lookups)
+        if self._redis:
+            try:
+                data = self._redis.get(f"result:{result_id}")
+                if data:
+                    result = ExtractionResult.model_validate_json(data)
+                    # Warm the memory cache for subsequent lookups
+                    with self._lock:
+                        self._by_result_id[result.result_id] = result
+                        self._by_document_id[result.document_id] = result.result_id
+                    return result
+            except Exception as e:
+                logger.warning("_ResultStore Redis read failed for result '%s': %s", result_id, e)
+        return None
+
+    def update(self, result: ExtractionResult) -> None:
+        with self._lock:
+            self._by_result_id[result.result_id] = result
+        # Overwrite in Redis — setex resets the TTL back to 24h on each update
+        self._redis_setex(f"result:{result.result_id}", 86400, result.model_dump_json())
+        self._redis_setex(f"docmap:{result.document_id}",  86400, result.result_id)
 
     def get_by_document_id(self, document_id: str) -> Optional[ExtractionResult]:
         with self._lock:
             result_id = self._by_document_id.get(document_id)
-            return self._by_result_id.get(result_id) if result_id else None
-
-    def update(self, result: ExtractionResult) -> None:
-        """Replace a stored result with an updated version (after correction)."""
-        with self._lock:
-            self._by_result_id[result.result_id] = result
+        if result_id:
+            return self.get_by_result_id(result_id)
+        # Not in warmed index — try Redis docmap key directly
+        if self._redis:
+            try:
+                result_id = self._redis.get(f"docmap:{document_id}")
+                if result_id:
+                    return self.get_by_result_id(result_id)
+            except Exception as e:
+                logger.warning(
+                    "_ResultStore Redis docmap lookup failed for doc '%s': %s", document_id, e
+                )
+        return None
 
     def save_correction(self, correction: HumanCorrection) -> None:
         with self._lock:
             self._corrections.append(correction)
+        # Persist to Redis — key per correction so we can scan by result_id prefix
+        self._redis_setex(
+            f"correction:{correction.result_id}:{correction.correction_id}",
+            86400,
+            correction.model_dump_json(),
+        )
 
     def get_corrections(self, result_id: str) -> List[HumanCorrection]:
         with self._lock:
-            return [c for c in self._corrections if c.result_id == result_id]
+            mem = [c for c in self._corrections if c.result_id == result_id]
+        if mem:
+            return mem
+        # Restore from Redis on post-restart lookup
+        if self._redis:
+            try:
+                keys = self._redis.keys(f"correction:{result_id}:*")
+                if keys:
+                    pipe = self._redis.pipeline()
+                    for key in keys:
+                        pipe.get(key)
+                    corrections = []
+                    for data in pipe.execute():
+                        if data:
+                            try:
+                                corrections.append(HumanCorrection.model_validate_json(data))
+                            except Exception:
+                                pass
+                    return corrections
+            except Exception as e:
+                logger.warning(
+                    "_ResultStore: failed to fetch corrections for result '%s': %s", result_id, e
+                )
+        return []
 
 
 # Module-level singleton — shared across all DocumentService instances
@@ -220,6 +340,10 @@ class DocumentService:
     def get_result(self, result_id: str) -> Optional[ExtractionResult]:
         """Retrieve a stored ExtractionResult by its result_id."""
         return _store.get_by_result_id(result_id)
+
+    def update_result(self, result: ExtractionResult) -> None:
+        """Persist changes to an existing result (approval, field edits, etc.)."""
+        _store.update(result)
 
     def get_result_by_document(self, document_id: str) -> Optional[ExtractionResult]:
         """Retrieve the ExtractionResult associated with a document_id."""

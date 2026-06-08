@@ -66,12 +66,12 @@ class ProviderInput(BaseModel):
         default=None,
         description="Raw image bytes of the document page. None for text-only providers."
     )
-    image_mime_type: str | None = Field(
+    image_mime_type: Optional[str] = Field(
         default=None,
         description="MIME type of image_bytes, e.g. 'image/jpeg'. Required if image_bytes is set."
     )
     page_count: int = Field(default=1, ge=1)
-    target_fields: list[str] | None = Field(
+    target_fields: Optional[List[str]] = Field(
         default=None,
         description=(
             "Field paths to extract. None = extract everything. "
@@ -80,7 +80,7 @@ class ProviderInput(BaseModel):
             "'totals.grand_total', 'line_items.0.unit_price', etc."
         )
     )
-    document_language: str | None = Field(
+    document_language: Optional[str] = Field(
         default=None,
         description="ISO 639-1 hint if language is already known. Helps model accuracy."
     )
@@ -103,8 +103,8 @@ class ProviderOutput(BaseModel):
     raw_response: str = Field(
         description="Full raw LLM response string, stored for debugging and audit"
     )
-    prompt_tokens: int | None = None
-    completion_tokens: int | None = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
     latency_ms: int = Field(description="Wall-clock inference time in milliseconds")
     parse_errors: List[str] = Field(
         default_factory=list,
@@ -157,31 +157,40 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
     "po_number": "The purchase order number or reference number",
     "po_date": "The date the PO was issued (ISO 8601: YYYY-MM-DD)",
     "due_date": "Payment or delivery due date (ISO 8601: YYYY-MM-DD)",
-    "payment_terms": "Payment terms string, e.g. 'Net 30', 'Net 60', 'COD'",
-    "delivery_terms": "Delivery/shipping terms, e.g. 'FOB Destination', 'CIF'",
-    "currency": "3-letter ISO 4217 currency code, e.g. 'USD', 'EUR', 'INR'",
+    "payment_terms": "Payment terms string, e.g. 'Net 30', 'Net 60', 'COD', '10 DAYS NET'",
+    "delivery_terms": "Delivery/shipping terms, e.g. 'FOB Destination', 'CIF', 'FREIGHT/CARRIAGE PAID'",
+    "currency": "3-letter ISO 4217 currency code, e.g. 'USD', 'EUR', 'GBP'. Look for currency symbols ($, £, €) or codes near amounts.",
     "document_language": "ISO 639-1 language code of the document, e.g. 'en', 'de'",
     "vendor.name": "Supplier / vendor company name",
-    "vendor.address": "Vendor street address",
-    "vendor.city": "Vendor city",
+    "vendor.address": (
+        "Vendor FULL postal address — combine ALL address lines into one string. "
+        "Include street number, street name, city/town, state/county, postcode/zip. "
+        "Example: '1 Main Street, Townsville, DH9 OTB'. Do NOT return just the street line."
+    ),
+    "vendor.city": "Vendor city or town",
     "vendor.country": "Vendor country",
     "vendor.email": "Vendor contact email address",
-    "vendor.phone": "Vendor contact phone number",
+    "vendor.phone": "Vendor contact phone number including area code",
     "vendor.tax_id": "Vendor tax ID, VAT number, GST number, or EIN",
-    "buyer.name": "Buying company name (the entity issuing the PO)",
-    "buyer.address": "Buyer street address",
-    "buyer.department": "Buyer department or cost centre",
+    "buyer.name": "Buying company name — check SHIP TO, BILL TO, or buyer sections",
+    "buyer.address": (
+        "Buyer/Ship-to FULL postal address — combine ALL address lines into one string. "
+        "Include street, city/town, state/county, postcode/zip. "
+        "Example: '44 Shore St, Macduff, AB4 1TX'. Do NOT return just the street line."
+    ),
+    "buyer.department": "Buyer department, cost centre, or division",
     "buyer.contact_person": "Buyer contact person name",
     "buyer.email": "Buyer contact email",
-    "totals.subtotal": "Sum of all line items before tax and shipping (numeric)",
-    "totals.tax_amount": "Total tax amount (numeric, not percentage)",
-    "totals.shipping": "Shipping or freight cost (numeric)",
-    "totals.discount": "Total discount applied (numeric)",
-    "totals.grand_total": "Final total amount payable (numeric)",
-    "totals.currency": "Currency for totals if different from document currency",
+    "totals.subtotal": "Sum of all line items before tax and shipping (numeric only, no currency symbol)",
+    "totals.tax_amount": "Total tax amount (numeric only, not percentage)",
+    "totals.shipping": "Shipping or freight cost (numeric only)",
+    "totals.discount": "Total discount applied (numeric only)",
+    "totals.grand_total": "Final total amount payable (numeric only, no currency symbol)",
+    "totals.currency": "Currency for totals — look for currency symbols ($, £, €) near the grand total",
     "line_items": (
-        "Array of line items. Each item: "
-        "{description, part_number, quantity, unit, unit_price, currency, line_total, tax_rate}"
+        "Array of ALL line items from the products/items table. Each item: "
+        "{description, part_number, quantity, unit, unit_price, currency, line_total, tax_rate}. "
+        "Include every row in the table — do not skip any."
     ),
 }
 
@@ -229,8 +238,8 @@ class BaseProvider(ABC):
         self,
         prompt: str,
         image_bytes: Optional[bytes],
-        image_mime_type: str | None,
-    ) -> tuple[str, int | None, int | None]:
+        image_mime_type: Optional[str],
+    ) -> tuple[str, Optional[int], Optional[int]]:
         """
         Make the API call and return (raw_text_response, prompt_tokens, completion_tokens).
 
@@ -325,7 +334,7 @@ class BaseProvider(ABC):
         self,
         ocr_text: str,
         fields: List[str],
-        language_hint: str | None = None,
+        language_hint: Optional[str] = None,
     ) -> str:
         """
         Construct the extraction prompt sent to every provider.
@@ -474,7 +483,7 @@ Return only the JSON object. Nothing else."""
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_json_from_response(text: str) -> str | None:
+    def _extract_json_from_response(text: str) -> Optional[str]:
         """
         Pull a JSON object out of a response that may contain surrounding text.
 
@@ -564,32 +573,47 @@ Return only the JSON object. Nothing else."""
         value: Any, model_confidence: float, ocr_text: str
     ) -> float:
         """
-        Boost confidence when the extracted value appears verbatim in the OCR text.
+        Adjust confidence based on whether the extracted value appears in OCR text.
 
-        Rationale: if the model says vendor name is "Acme Corp" and "Acme Corp"
-        is literally in the OCR text, the extraction is almost certainly correct
-        regardless of what confidence the model self-reported. Conversely, if the
-        value is NOT in the OCR text, the model may be hallucinating — cap the score.
+        Boost when found verbatim — the model is almost certainly right.
+        No penalty when not found — the model is using vision (reading the image
+        directly), not just regurgitating OCR text. Vision extraction is valid
+        even when the OCR text is sparse or the value spans multiple lines.
 
-        The heuristic is additive on top of the model's self-reported score,
-        with a ceiling of 0.95 (never fully trust automated extraction).
+        The old cap (0.70) was too aggressive — it caused correctly extracted
+        multi-line values (addresses, compound names) to always fall below the
+        0.75 review threshold, flooding the review queue with false positives.
+
+        Ceiling of 0.95 — never fully trust automated extraction.
         """
         if value is None or not isinstance(value, (str, int, float)):
             return model_confidence
 
         value_str = str(value).strip()
         if len(value_str) < 3:
-            # Too short to be a meaningful signal (single letters, "0", etc.)
             return model_confidence
 
-        if value_str.lower() in ocr_text.lower():
-            # Value found verbatim — boost toward high confidence
-            boosted = min(0.95, model_confidence + 0.15)
-            return boosted
-        else:
-            # Value not in OCR text — model may be inferring or hallucinating
-            # Cap at 0.7 so it doesn't slip past the threshold without scrutiny
-            return model_confidence
+        # Check verbatim match and also check individual parts for multi-line values
+        ocr_lower = ocr_text.lower()
+        value_lower = value_str.lower()
+
+        # Full value found verbatim → strong boost
+        if value_lower in ocr_lower:
+            return min(0.95, model_confidence + 0.15)
+
+        # For multi-part values (addresses), check if most parts are in OCR text
+        parts = [p.strip().lower() for p in value_str.replace(',', ' ').split()
+                 if len(p.strip()) >= 3]
+        if parts:
+            found_parts = sum(1 for p in parts if p in ocr_lower)
+            coverage = found_parts / len(parts)
+            if coverage >= 0.5:
+                # At least half the words found — partial boost
+                return min(0.92, model_confidence + 0.08)
+
+        # Value not found in OCR text at all — model used vision directly.
+        # Don't penalise. Vision extraction is valid without OCR text match.
+        return model_confidence
 
     def _make_field_extraction(
         self,

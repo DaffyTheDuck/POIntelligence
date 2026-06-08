@@ -31,13 +31,17 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 from app.config import get_settings
 from app.models.po_models import (
+    ApprovalRecord,
+    ApprovalStatus,
     CorrectionRequest,
     CorrectionResponse,
     ExportRequest,
     JobStatusResponse,
+    ModelSource,
     UploadResponse,
 )
 from app.providers.groq_provider import GroqProvider
@@ -299,6 +303,204 @@ async def submit_correction(
 
 
 # ===========================================================================
+# Approval — explicit reviewer sign-off (human-in-the-loop gate)
+# ===========================================================================
+
+
+class ApproveRequest(BaseModel):
+    result_id:   str
+    reviewer_id: str = Field(default="reviewer", description="Who is approving")
+    notes:       Optional[str] = Field(default=None)
+
+
+class RejectRequest(BaseModel):
+    result_id:   str
+    reviewer_id: str = Field(default="reviewer")
+    reason:      str = Field(..., description="Required reason for rejection")
+
+
+class ApproveFieldRequest(BaseModel):
+    result_id:   str
+    field_name:  str
+    reviewer_id: str = Field(default="reviewer")
+
+
+@router.post(
+    "/approve-field",
+    summary="Approve an individual field value",
+    description="One-click approval for a single field. Sets confidence to 1.0 and marks as human-verified. When all flagged fields are approved, document is ready for final approval.",
+)
+async def approve_field(
+    request: ApproveFieldRequest,
+    document_service: DocumentService = Depends(get_document_service),
+) -> JSONResponse:
+    result = document_service.get_result(request.result_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Result '{request.result_id}' not found.")
+
+    ext = result.field_extractions.get(request.field_name)
+    if ext is None:
+        raise HTTPException(status_code=404, detail=f"Field '{request.field_name}' not found.")
+
+    # Mark as human-confirmed — same as submitting a correction with unchanged value
+    result.field_extractions[request.field_name] = ext.model_copy(update={
+        'confidence':         1.0,
+        'source_model':       ModelSource.HUMAN,
+        'flagged_for_review': False,
+        'review_reason':      None,
+    })
+
+    # Remove from flagged list
+    result.fields_flagged_for_review = [
+        f for f in result.fields_flagged_for_review
+        if f != request.field_name
+    ]
+
+    document_service.update_result(result)
+
+    return JSONResponse({
+        "approved":           True,
+        "field_name":         request.field_name,
+        "fields_remaining":   len(result.fields_flagged_for_review),
+        "all_fields_cleared": len(result.fields_flagged_for_review) == 0,
+    })
+
+
+class ApproveAllFieldsRequest(BaseModel):
+    result_id:   str
+    reviewer_id: str = Field(default="reviewer")
+
+
+@router.post(
+    "/approve-all-fields",
+    summary="Bulk-approve all flagged fields",
+    description=(
+        "One-click approval for every field currently in the review queue. "
+        "Each flagged field is marked as human-verified (confidence → 1.0, source → human). "
+        "Returns the count of approved fields and the cleared list."
+    ),
+)
+async def approve_all_fields(
+    request: ApproveAllFieldsRequest,
+    document_service: DocumentService = Depends(get_document_service),
+) -> JSONResponse:
+    result = document_service.get_result(request.result_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Result '{request.result_id}' not found.")
+
+    flagged = list(result.fields_flagged_for_review)  # snapshot before mutation
+    if not flagged:
+        return JSONResponse({
+            "approved_count": 0,
+            "approved_fields": [],
+            "message": "No flagged fields to approve.",
+        })
+
+    approved_fields = []
+    for field_name in flagged:
+        ext = result.field_extractions.get(field_name)
+        if ext is None:
+            continue  # field no longer exists — skip
+        result.field_extractions[field_name] = ext.model_copy(update={
+            'confidence':         1.0,
+            'source_model':       ModelSource.HUMAN,
+            'flagged_for_review': False,
+            'review_reason':      None,
+        })
+        approved_fields.append(field_name)
+
+    # Clear the flagged list entirely
+    result.fields_flagged_for_review = []
+
+    document_service.update_result(result)
+
+    logger.info(
+        "Bulk field approval: result_id=%s reviewer=%s approved=%d fields=%s",
+        request.result_id, request.reviewer_id, len(approved_fields), approved_fields,
+    )
+
+    return JSONResponse({
+        "approved_count":  len(approved_fields),
+        "approved_fields": approved_fields,
+        "message":         f"{len(approved_fields)} field(s) approved.",
+    })
+
+
+@router.post(
+    "/approve",
+    summary="Approve a document for export",
+)
+async def approve_result(
+    request: ApproveRequest,
+    document_service: DocumentService = Depends(get_document_service),
+    export_service:   ExportService   = Depends(get_export_service),
+) -> JSONResponse:
+
+    result = document_service.get_result(request.result_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Result '{request.result_id}' not found.")
+
+    result.approval = ApprovalRecord(
+        status      = ApprovalStatus.APPROVED,
+        reviewer_id = request.reviewer_id,
+        approved_at = datetime.now(timezone.utc),
+        notes       = request.notes,
+    )
+
+    # Persist via the correct update method
+    document_service.update_result(result)
+
+    logger.info("Result approved: result_id=%s reviewer=%s", request.result_id, request.reviewer_id)
+
+    # Fire webhook on approval (non-blocking)
+    try:
+        await export_service.fire_webhook(result)
+    except Exception as e:
+        logger.warning("Webhook after approval failed: %s", e)
+
+    return JSONResponse({
+        "approved":    True,
+        "result_id":   result.result_id,
+        "reviewer_id": request.reviewer_id,
+        "approved_at": result.approval.approved_at.isoformat(),
+        "notes":       request.notes,
+    })
+
+
+@router.post(
+    "/reject",
+    summary="Reject a document — marks it as needing re-review",
+)
+async def reject_result(
+    request: RejectRequest,
+    document_service: DocumentService = Depends(get_document_service),
+) -> JSONResponse:
+
+    result = document_service.get_result(request.result_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Result '{request.result_id}' not found.")
+
+    result.approval = ApprovalRecord(
+        status      = ApprovalStatus.REJECTED,
+        reviewer_id = request.reviewer_id,
+        approved_at = datetime.now(timezone.utc),
+        notes       = request.reason,
+    )
+
+    document_service.update_result(result)
+
+    logger.info("Result rejected: result_id=%s reviewer=%s reason=%s",
+                request.result_id, request.reviewer_id, request.reason)
+
+    return JSONResponse({
+        "rejected":    True,
+        "result_id":   result.result_id,
+        "reviewer_id": request.reviewer_id,
+        "reason":      request.reason,
+    })
+
+
+# ===========================================================================
 # Export — local file generation (architecture decision #9)
 # ===========================================================================
 
@@ -336,9 +538,11 @@ async def export_result(
         )
 
     try:
-        file_path = await export_service.generate_export(result, request)
+        file_path = await export_service.generate_export(
+            result, request, force=getattr(request, 'force', False)
+        )
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=422, detail=str(e))
 
     # Fire webhook (best-effort — failure doesn't affect the file response)
     if get_settings().webhooks_enabled:

@@ -201,6 +201,18 @@ class Settings(BaseSettings):
         ge=1,
         description="Number of pages to process per surya batch. 1 is safe for 4GB VRAM."
     )
+    surya_detector_thresh: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Detection confidence threshold for surya's DetectionPredictor. "
+            "Lower values (0.1) detect more regions on scanned/low-contrast documents, "
+            "reducing fallback to horizontal strip OCR. "
+            "Higher values (0.3+) are more conservative. "
+            "Set via SURYA_DETECTOR_THRESH in .env."
+        )
+    )
     ocr_fuzzy_match_threshold: float = Field(
         default=0.85,
         ge=0.0,

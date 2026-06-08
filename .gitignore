@@ -1,0 +1,57 @@
+# Environment Variables
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Uploads & Generated Files
+uploads/
+exports/
+
+# Test/Temporary Files
+test_*.png
+export_test.csv
+export_test.json
+export_test.xml
+
+# Backup Files
+*_backup.zip
+*.bak
+
+# Python Build Artifacts
+build/
+dist/
+*.egg-info/
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Cache
+.cache/
+
+# SQLite
+*.db
+*.sqlite3
