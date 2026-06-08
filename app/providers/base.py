@@ -8,8 +8,8 @@ The Strategy pattern: router_service holds a BaseProvider reference and calls
 Swap the concrete class → swap the model. Zero other changes required.
 
 Two concrete implementations:
-  - OllamaProvider  (app/providers/ollama_provider.py) — local phi3.5-vision
-  - ClaudeProvider  (app/providers/claude_provider.py) — Claude API fallback
+  - OllamaProvider  (app/providers/ollama_provider.py) — local llava-phi3
+  - GroqProvider    (app/providers/groq_provider.py)   — Groq API fallback
 
 Shared logic that lives here (not in subclasses):
   - ProviderInput / ProviderOutput data shapes
@@ -51,8 +51,8 @@ class ProviderInput(BaseModel):
 
     Design note — why carry both ocr_text AND image_bytes:
       surya gives us clean OCR text, which is the primary input for semantic
-      extraction (architecture decision #7). But phi3.5-vision is a vision model —
-      it performs better with the image alongside the text. Claude Vision also
+      extraction (architecture decision #7). But llava-phi3 is a vision model —
+      it performs better with the image alongside the text. Groq Vision also
       accepts images. Both providers receive both; each uses what it can.
 
     target_fields controls partial re-extraction:
@@ -122,9 +122,14 @@ ALL_EXTRACTABLE_FIELDS: List[str] = [
     "po_number",
     "po_date",
     "due_date",
+    "required_by",
     "payment_terms",
+    "payment_method",
     "delivery_terms",
     "currency",
+    "authorized_by",
+    "special_instructions",
+    "ship_to",
     "document_language",
     # Vendor
     "vendor.name",
@@ -149,17 +154,43 @@ ALL_EXTRACTABLE_FIELDS: List[str] = [
     "totals.currency",
     # Line items — extracted as a block, parsed separately
     "line_items",
+    # Catch-all for any document-specific fields not covered above
+    "additional_fields",
 ]
 
 # Human-readable descriptions injected into the prompt.
-# Reduces hallucination on ambiguous field names.
 FIELD_DESCRIPTIONS: Dict[str, str] = {
     "po_number": "The purchase order number or reference number",
     "po_date": "The date the PO was issued (ISO 8601: YYYY-MM-DD)",
     "due_date": "Payment or delivery due date (ISO 8601: YYYY-MM-DD)",
+    "required_by": (
+        "The date by which the order must be fulfilled — often labelled "
+        "'Required By', 'Need By Date', 'Delivery Due', or 'Must Arrive By'. "
+        "Return as ISO 8601 date string (YYYY-MM-DD)."
+    ),
     "payment_terms": "Payment terms string, e.g. 'Net 30', 'Net 60', 'COD', '10 DAYS NET'",
+    "payment_method": (
+        "How payment will be made — e.g. 'ACH Transfer', 'Wire Transfer', "
+        "'Check', 'Credit Card', 'Bank Transfer'. Often labelled 'Payment Method' "
+        "or 'Payment Type'. Return null if not found."
+    ),
     "delivery_terms": "Delivery/shipping terms, e.g. 'FOB Destination', 'CIF', 'FREIGHT/CARRIAGE PAID'",
     "currency": "3-letter ISO 4217 currency code, e.g. 'USD', 'EUR', 'GBP'. Look for currency symbols ($, £, €) or codes near amounts.",
+    "authorized_by": (
+        "The name of the person who authorized or signed the PO — "
+        "often labelled 'Authorized By', 'Approved By', 'Signature', or 'Authorized Signature'. "
+        "Return the person's name only, not their title."
+    ),
+    "special_instructions": (
+        "Any special delivery, packaging, or handling instructions found in the document — "
+        "often labelled 'Special Instructions', 'Notes', 'Remarks', or 'Comments'. "
+        "Return the full instruction text as-is."
+    ),
+    "ship_to": (
+        "Ship-to address if it is different from the buyer's address — "
+        "often labelled 'Ship To', 'Deliver To', or 'Shipping Address'. "
+        "Combine all address lines into one string."
+    ),
     "document_language": "ISO 639-1 language code of the document, e.g. 'en', 'de'",
     "vendor.name": "Supplier / vendor company name",
     "vendor.address": (
@@ -191,6 +222,14 @@ FIELD_DESCRIPTIONS: Dict[str, str] = {
         "Array of ALL line items from the products/items table. Each item: "
         "{description, part_number, quantity, unit, unit_price, currency, line_total, tax_rate}. "
         "Include every row in the table — do not skip any."
+    ),
+    "additional_fields": (
+        "A flat JSON object of any other named fields found in the document that do NOT fit "
+        "the fields above. Common examples: contract number, project code, department code, "
+        "vendor ID, reference number, ship via, carrier, terms code. "
+        "Use descriptive snake_case keys. Example: "
+        '{\"vendor_id\": \"VS4892\", \"contract_number\": \"CTR-2024-001\", \"ship_via\": \"FedEx Ground\"}. '
+        "Return null if there are no extra fields."
     ),
 }
 
@@ -224,7 +263,7 @@ class BaseProvider(ABC):
     @property
     @abstractmethod
     def model_name(self) -> str:
-        """Identifier string for this model, e.g. 'phi3.5-vision' or 'claude-opus-4-5'."""
+        """Identifier string for this model, e.g. 'llava-phi3' or 'meta-llama/llama-4-scout-17b-16e-instruct'."""
         ...
 
     @property
@@ -339,7 +378,7 @@ class BaseProvider(ABC):
         """
         Construct the extraction prompt sent to every provider.
 
-        The prompt is identical for Ollama and Claude — the only difference
+        The prompt is identical for Ollama and Groq — the only difference
         between providers is HOW the prompt is delivered (API call format),
         not WHAT it says. Keeping it here means one place to tune extraction
         behaviour.
@@ -412,6 +451,9 @@ Return only the JSON object. Nothing else."""
         field_extractions: Dict[str, FieldExtraction] = {}
 
         # Step 1: Extract JSON from the response
+        logger.debug(
+            "Raw LLM response (first 500 chars): %r", raw_response[:500]
+        )
         cleaned = self._extract_json_from_response(raw_response)
         if cleaned is None:
             parse_errors.append(
@@ -448,13 +490,18 @@ Return only the JSON object. Nothing else."""
                 continue
 
             if not isinstance(raw_field, dict):
-                # Model returned a bare value instead of {value, confidence} — recover
+                # Model returned a bare value instead of {value, confidence} — recover.
+                # Use 0.7 (above review threshold) rather than 0.5 — if the model
+                # extracted a value at all, it is likely correct. The OCR heuristic
+                # below will further boost it if the value appears verbatim in OCR text.
+                # llava-phi3 commonly returns flat JSON, ignoring the {value, confidence}
+                # structure, so this path fires on every llava extraction.
                 parse_errors.append(
                     f"Field '{field_path}' expected {{value, confidence}} dict, "
-                    f"got {type(raw_field).__name__}. Wrapping with confidence=0.5."
+                    f"got {type(raw_field).__name__}. Wrapping with confidence=0.7."
                 )
                 value = raw_field
-                confidence = 0.5
+                confidence = 0.7
             else:
                 value = raw_field.get("value")
                 confidence = self._coerce_confidence(

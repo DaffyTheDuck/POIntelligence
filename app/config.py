@@ -72,20 +72,27 @@ class Settings(BaseSettings):
         )
     )
     ollama_model: str = Field(
-        default="phi3.5-vision",
+        default="llava-phi3",
         description="Ollama model tag to use for extraction. Must be pulled on the Linux machine."
     )
     ollama_timeout_seconds: int = Field(
-        default=60,
+        default=1800,
         ge=10,
-        le=300,
-        description="Max seconds to wait for an Ollama response before treating it as failed."
+        le=7200,
+        description=(
+            "Max seconds to wait for an Ollama response before treating it as failed. "
+            "Set high (1800+) when testing local vision models on limited VRAM — "
+            "a cold llava-phi3 inference on a GTX 1650 can take several minutes."
+        )
     )
     ollama_max_retries: int = Field(
-        default=2,
+        default=0,
         ge=0,
         le=5,
-        description="Number of times to retry a failed Ollama request before falling back to Claude."
+        description=(
+            "Number of times to retry a failed Ollama request before falling back to Groq. "
+            "Set to 0 when testing with long timeouts — retries multiply the wait time."
+        )
     )
 
     # -----------------------------------------------------------------------
@@ -119,7 +126,7 @@ class Settings(BaseSettings):
         default=90,
         ge=10,
         le=300,
-        description="Max seconds to wait for the fallback API provider."
+        description="Max seconds to wait for the fallback API provider (Groq)."
     )
     claude_max_tokens: int = Field(
         default=4096,
@@ -135,9 +142,9 @@ class Settings(BaseSettings):
         ge=0.0,
         le=1.0,
         description=(
-            "Fields with confidence below this score trigger Claude fallback. "
+            "Fields with confidence below this score trigger Groq fallback. "
             "Set to 0.0 to always use local model only. "
-            "Set to 1.0 to always escalate everything to Claude (useful for demos)."
+            "Set to 1.0 to always escalate everything to Groq (useful for demos)."
         )
     )
     disagreement_threshold: float = Field(
@@ -145,7 +152,7 @@ class Settings(BaseSettings):
         ge=0.0,
         le=1.0,
         description=(
-            "If |local_confidence - claude_confidence| exceeds this, flag for human review. "
+            "If |local_confidence - groq_confidence| exceeds this, flag for human review. "
             "Architecture decision #4."
         )
     )
@@ -175,7 +182,7 @@ class Settings(BaseSettings):
         ge=1,
         description=(
             "Number of concurrent Celery tasks. "
-            "Keep at 1 — the GTX 1650 has 4GB VRAM. Running two phi3.5-vision "
+            "Keep at 1 — the GTX 1650 has 4GB VRAM. Running two llava-phi3 "
             "inferences simultaneously will OOM. Queue protects the GPU."
         )
     )
@@ -382,8 +389,8 @@ class Settings(BaseSettings):
 
     @property
     def webhooks_enabled(self) -> bool:
-        """True only when a webhook URL is configured."""
-        return self.webhook_url is not None
+        """True only when a non-empty webhook URL is configured."""
+        return bool(self.webhook_url and self.webhook_url.strip())
 
     @property
     def celery_broker_url(self) -> str:

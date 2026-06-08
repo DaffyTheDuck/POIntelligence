@@ -211,7 +211,11 @@ async def list_jobs() -> JSONResponse:
             "confidence":    round(j.result.overall_confidence, 3) if j.result else None,
             "flagged":       len(j.result.fields_flagged_for_review) if j.result else None,
             "duration_ms":   j.result.processing_duration_ms if j.result else None,
-            "primary_model": j.result.primary_model.value if j.result else None,
+            "primary_model": (
+                j.result.primary_model.value
+                if j.result and hasattr(j.result.primary_model, 'value')
+                else str(j.result.primary_model) if j.result else None
+            ),
             "fallback":      j.result.fallback_triggered if j.result else None,
             "created_at":    j.created_at.isoformat(),
             "error":         j.error_message,

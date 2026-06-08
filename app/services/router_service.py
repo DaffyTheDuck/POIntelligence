@@ -9,10 +9,10 @@ Flow for every document:
   3. Select primary provider (auto-routed, architecture decision #2)
   4. Run primary extraction
   5. Find fields below confidence threshold (architecture decision #3)
-  6. If low-confidence fields exist AND Claude is available:
-       → Re-extract only those fields via Claude (target_fields)
+  6. If low-confidence fields exist AND Groq is available:
+       → Re-extract only those fields via Groq (target_fields)
        → Detect value disagreement between providers (architecture decision #4)
-       → Merge: Claude's extractions replace Ollama's for fallback fields
+       → Merge: Groq's extractions replace Ollama's for fallback fields
   7. Return RouterDecision with merged output + routing metadata
 
 What the router does NOT do:
@@ -51,10 +51,14 @@ from app.services.ocr_service import OCRDocument
 
 logger = logging.getLogger(__name__)
 
-# Document quality score below which we skip Ollama and go straight to Claude.
-# Rationale: if surya is averaging <0.6 confidence, the scan is too degraded
-# for phi3.5-vision to handle reliably. Don't waste time on a doomed inference.
-_QUALITY_THRESHOLD_FOR_LOCAL = 0.99
+# Document quality score below which we skip Ollama and go straight to Groq.
+# Rationale: moondream is a vision model — it reads the image directly and is
+# not dependent on OCR quality. Only route away from it on truly catastrophic
+# scans. 0.30 means even poor scans go to moondream; surya returning no text
+# at all (score=0.50 neutral fallback) still routes to moondream correctly.
+# The old value of 0.60 was wrong for a vision model — it was designed for
+# text-only models that struggle when OCR confidence is low.
+_QUALITY_THRESHOLD_FOR_LOCAL = 0.30
 
 # Health check cache TTL — 30s balances freshness vs latency.
 # A crashed Ollama will be detected within 30s. An HTTP health check takes ~300ms.
@@ -77,8 +81,8 @@ class RouterDecision:
     """
     merged_output: ProviderOutput
     primary_source: ModelSource       # Which model ran first
-    fallback_triggered: bool          # True if Claude was called
-    fallback_fields: List[str]        # Fields that were re-extracted by Claude
+    fallback_triggered: bool          # True if Groq was called
+    fallback_fields: List[str]        # Fields that were re-extracted by Groq
     disagreement_fields: List[str]    # Fields where models produced different values
     document_quality_score: float     # 0-1, from surya average confidence
     ollama_available: bool            # Recorded for audit / monitoring
@@ -165,9 +169,9 @@ class RouterService:
             primary_output = await primary.extract(primary_input)
         except ProviderError as e:
             logger.error("Primary provider '%s' failed: %s", primary.model_name, e)
-            # If primary was Ollama and Claude is available, fall through to Claude
+            # If primary was Ollama and Groq is available, fall through to Groq
             if primary.source == ModelSource.LOCAL and claude_ok:
-                logger.warning("Falling back to Claude as primary due to Ollama failure.")
+                logger.warning("Falling back to Groq as primary due to Ollama failure.")
                 primary = self._claude
                 primary_output = await primary.extract(primary_input)
             else:
@@ -200,7 +204,7 @@ class RouterService:
 
         # Step 6: Run fallback on low-confidence fields
         logger.info(
-            "%d fields below confidence threshold %.2f → escalating to Claude: %s",
+            "%d fields below confidence threshold %.2f → escalating to Groq: %s",
             len(low_confidence_fields),
             settings.confidence_threshold,
             low_confidence_fields,
@@ -208,7 +212,7 @@ class RouterService:
 
         if not claude_ok:
             logger.warning(
-                "Low-confidence fields detected but Claude is unavailable. "
+                "Low-confidence fields detected but Groq is unavailable. "
                 "Flagging %d fields for human review.",
                 len(low_confidence_fields),
             )
@@ -227,7 +231,7 @@ class RouterService:
                 claude_available=False,
             )
 
-        # Claude is available — run targeted fallback
+        # Groq is available — run targeted fallback
         fallback_input = self._build_provider_input(
             ocr_doc, target_fields=low_confidence_fields
         )
@@ -235,7 +239,7 @@ class RouterService:
         try:
             fallback_output = await self._claude.extract(fallback_input)
         except ProviderError as e:
-            logger.error("Claude fallback failed: %s. Flagging fields for human review.", e)
+            logger.error("Groq fallback failed: %s. Flagging fields for human review.", e)
             flagged_output = self._flag_fields_for_review(
                 primary_output, low_confidence_fields, ReviewReason.LOW_CONFIDENCE
             )
@@ -251,7 +255,7 @@ class RouterService:
             )
 
         logger.info(
-            "Claude fallback complete. %d fields re-extracted, latency=%dms",
+            "Groq fallback complete. %d fields re-extracted, latency=%dms",
             len(fallback_output.field_extractions),
             fallback_output.latency_ms,
         )
@@ -296,8 +300,8 @@ class RouterService:
         Select which provider runs first. This is auto-routing — no user input.
 
         Decision tree:
-          Ollama unavailable        → Claude (no choice)
-          Document quality < 0.60   → Claude directly (degrade scan, local will fail)
+          Ollama unavailable        → Groq (no choice)
+          Document quality < 0.60   → Groq directly (degraded scan, local will fail)
           Otherwise                 → Ollama (local first, cheaper, faster)
 
         Architecture decision #2: the system decides routing, not the user.
@@ -305,18 +309,13 @@ class RouterService:
         low confidence, we don't waste GPU time on a doomed Ollama inference.
         """
 
-        if claude_ok:
-            logger.debug("Using Groq as primary (Ollama disabled due to timeout issues)")
-            return self._claude
-        return self._ollama
-
         if not ollama_ok:
-            logger.debug("Selecting Claude as primary: Ollama unavailable.")
+            logger.debug("Selecting Groq as primary: Ollama unavailable.")
             return self._claude
 
         if quality_score < _QUALITY_THRESHOLD_FOR_LOCAL:
             logger.debug(
-                "Selecting Claude as primary: document quality %.2f < threshold %.2f.",
+                "Selecting Groq as primary: document quality %.2f < threshold %.2f.",
                 quality_score, _QUALITY_THRESHOLD_FOR_LOCAL,
             )
             return self._claude
@@ -331,7 +330,7 @@ class RouterService:
         """
         Return field paths where confidence is below the configured threshold.
 
-        These are the fields Claude will re-extract. By passing them as
+        These are the fields Groq will re-extract. By passing them as
         target_fields, the fallback prompt only asks for these fields —
         not the entire document. This is the key cost-reduction mechanism.
 
@@ -354,7 +353,7 @@ class RouterService:
         fallback_output: ProviderOutput,
     ) -> List[str]:
         """
-        Find fields where Ollama and Claude extracted different values.
+        Find fields where Ollama and Groq extracted different values.
 
         Disagreement is declared when ALL of the following are true:
           1. Both providers extracted a non-None value for the field
@@ -363,7 +362,7 @@ class RouterService:
 
         Condition 3 matters: if both models return different values but are both
         high-confidence, that's a strong signal something is genuinely ambiguous.
-        If one model is low-confidence, the difference is expected — Claude's
+        If one model is low-confidence, the difference is expected — Groq's
         value wins without being flagged as a disagreement.
 
         Architecture decision #4: flag for human review, never guess.
@@ -391,7 +390,7 @@ class RouterService:
             conf_delta = abs(primary_ext.confidence - fallback_ext.confidence)
             if conf_delta > DISAGREEMENT_THRESHOLD:
                 logger.debug(
-                    "Disagreement on '%s': primary=%r (%.2f) vs claude=%r (%.2f), delta=%.2f",
+                    "Disagreement on '%s': primary=%r (%.2f) vs groq=%r (%.2f), delta=%.2f",
                     field_path,
                     primary_ext.value, primary_ext.confidence,
                     fallback_ext.value, fallback_ext.confidence,
@@ -412,15 +411,15 @@ class RouterService:
         disagreement_fields: List[str],
     ) -> ProviderOutput:
         """
-        Merge primary (Ollama) and fallback (Claude) field extractions.
+        Merge primary (Ollama) and fallback (Groq) field extractions.
 
         Merge rules per field:
           Not in fallback output  → keep primary as-is
-          In fallback, no disagree → use Claude's extraction (it ran because primary was low)
-          In fallback, disagree    → use Claude's value but flag MODEL_DISAGREEMENT
+          In fallback, no disagree → use Groq's extraction (it ran because primary was low)
+          In fallback, disagree    → use Groq's value but flag MODEL_DISAGREEMENT
 
         The merged output's source is recorded as LOCAL (primary was Ollama)
-        because that's what ran first. The fallback fields carry CLAUDE as their
+        because that's what ran first. The fallback fields carry GROQ as their
         source individually inside FieldExtraction.source_model.
         """
         merged_extractions: Dict[str, FieldExtraction] = dict(
@@ -429,13 +428,13 @@ class RouterService:
 
         for field_path, claude_ext in fallback_output.field_extractions.items():
             if field_path in disagreement_fields:
-                # Models disagreed — keep Claude's value but flag for human review
+                # Models disagreed — keep Groq's value but flag for human review
                 merged_extractions[field_path] = claude_ext.model_copy(update={
                     "flagged_for_review": True,
                     "review_reason": ReviewReason.MODEL_DISAGREEMENT,
                 })
             else:
-                # Claude ran and agreed (or primary had no value) — use Claude's result
+                # Groq ran and agreed (or primary had no value) — use Groq's result
                 merged_extractions[field_path] = claude_ext
 
         # Rebuild a ProviderOutput with merged extractions.
@@ -564,7 +563,7 @@ class RouterService:
     ) -> ProviderOutput:
         """
         Return a copy of output with specified fields marked for human review.
-        Used when Claude fallback is unavailable and we can't escalate.
+        Used when Groq fallback is unavailable and we can't escalate.
         """
         updated = dict(output.field_extractions)
         for field_path in fields_to_flag:

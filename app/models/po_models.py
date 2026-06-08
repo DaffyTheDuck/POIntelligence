@@ -248,22 +248,34 @@ class POData(BaseModel):
     po_number: Optional[str] = None
     po_date: Optional[str] = Field(default=None, description="ISO 8601 date string")
     due_date: Optional[str] = Field(default=None, description="Payment or delivery due date")
+    required_by: Optional[str] = Field(default=None, description="Date order must be fulfilled by")
     payment_terms: Optional[str] = Field(default=None, description="e.g. 'Net 30'")
+    payment_method: Optional[str] = Field(default=None, description="e.g. 'ACH Transfer', 'Wire', 'Check'")
     delivery_terms: Optional[str] = Field(default=None, description="e.g. 'FOB Destination'")
     currency: Optional[str] = Field(default=None, min_length=3, max_length=3)
+    authorized_by: Optional[str] = Field(default=None, description="Name of the person who authorized the PO")
+    special_instructions: Optional[str] = Field(
+        default=None,
+        description="Shipping, packaging, or handling instructions"
+    )
 
     vendor: Optional[VendorInfo] = None
     buyer: Optional[BuyerInfo] = None
+    ship_to: Optional[str] = Field(default=None, description="Ship-to address if different from buyer")
     line_items: List[LineItem] = Field(default_factory=list)
     totals: Optional[POTotals] = None
 
-    notes: Optional[str] = Field(default=None, description="Free-text notes or special instructions")
+    notes: Optional[str] = Field(default=None, description="Free-text notes")
     document_language: Optional[str] = Field(
         default=None,
         description="ISO 639-1 language code detected in the document"
     )
+    additional_fields: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Any other key-value fields found in the document not covered above"
+    )
 
-    @field_validator("po_date", "due_date", mode="before")
+    @field_validator("po_date", "due_date", "required_by", mode="before")
     @classmethod
     def coerce_date_to_string(cls, v: Any) -> Optional[str]:
         """Accept datetime objects and convert to ISO string for uniform storage."""

@@ -50,10 +50,13 @@ _MAX_IMAGE_DIMENSION = 1024
 # temperature: 0 = fully deterministic. Never deviate from this for extraction.
 _OLLAMA_OPTIONS = {
     "temperature": 0,
-    "num_ctx": 4096,
-    "num_predict": 2048,
+    "num_ctx": 8192,
+    "num_predict": 4096,   # 32 fields × ~50 tokens each + line_items easily exceeds 2048
     "top_p": 1.0,
     "repeat_penalty": 1.0,
+    "cache_prompt": False,  # Force fresh evaluation — cached responses return stale
+                            # extractions from previous documents,
+    "think": False
 }
 
 
@@ -84,6 +87,29 @@ class OllamaProvider(BaseProvider):
     @property
     def source(self) -> ModelSource:
         return ModelSource.LOCAL
+
+    @property
+    def is_vision_model(self) -> bool:
+        """
+        Return True if the configured Ollama model supports image input.
+
+        Text-only models (qwen2.5, mistral, llama3, etc.) must NOT receive
+        image bytes — Ollama will either error or silently ignore them.
+        Vision models (llava, phi3.5-vision, moondream, etc.) expect images.
+
+        Note: llava-phi3 was evaluated but disabled (hardcoded False) because
+        its 4096-token context window was consumed entirely by image patch tokens,
+        leaving no room for the 32-field prompt + JSON response — producing
+        garbled output at 354s inference time.
+
+        moondream uses a much more efficient vision encoder (SigLIP), fits in
+        ~1.8GB VRAM, and natively supports structured JSON output — making it
+        the correct choice for local vision extraction on 4GB hardware.
+
+        Checked by _build_chat_message to conditionally attach image data.
+        """
+        vision_keywords = ["llava", "vision", "moondream", "bakllava"]
+        return any(kw in self.model_name.lower() for kw in vision_keywords)
 
     # ------------------------------------------------------------------
     # Core API call — the only method subclasses need to implement
@@ -118,6 +144,8 @@ class OllamaProvider(BaseProvider):
             "messages": [message],
             "stream": False,
             "options": _OLLAMA_OPTIONS,
+            "keep_alive": 0,  # Unload model immediately after inference so surya
+                              # has full VRAM available on the next request.
         }
 
         last_error: Optional[Exception] = None
@@ -282,7 +310,7 @@ class OllamaProvider(BaseProvider):
         """
         message: dict = {"role": "user", "content": prompt}
 
-        if image_bytes is not None:
+        if image_bytes is not None and self.is_vision_model:
             resized_bytes = self._resize_image(image_bytes, image_mime_type)
             encoded = base64.b64encode(resized_bytes).decode("utf-8")
             message["images"] = [encoded]

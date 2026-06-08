@@ -253,11 +253,9 @@ class ExtractionService:
             row_path = f'line_items.{i}'
 
             # Step 1: description bbox as row y-anchor
+            # LLM spatial hint intentionally skipped — makes one Groq call per item
+            # = 6+ extra calls = 90+ extra seconds. If exact+fuzzy can't find it, skip.
             desc_bbox, method = self._ocr._resolve_bounding_box(desc_str, all_lines)
-            if desc_bbox is None:
-                desc_bbox, method = await self._ocr._llm_spatial_hint(
-                    f'line_items.{i}.description', desc_str, all_lines
-                )
             if desc_bbox is None:
                 continue
 

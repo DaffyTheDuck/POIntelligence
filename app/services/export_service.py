@@ -145,6 +145,13 @@ class ExportService:
         """
         output: dict = result.po_data.model_dump(exclude_none=True)
 
+        # Apply human corrections — field_extractions has the corrected values
+        # but po_data keeps the original extraction. Merge before exporting so
+        # corrected/confirmed field values always appear in the download.
+        output = ExportService._apply_corrections_to_output(
+            output, result.field_extractions
+        )
+
         if include_metadata:
             # Filter out internal pseudo-paths (line_items.N.description added for bbox)
             real_fields = {
@@ -174,6 +181,38 @@ class ExportService:
             }
 
         return json.dumps(output, indent=2, ensure_ascii=False, default=str).encode("utf-8")
+
+    @staticmethod
+    def _apply_corrections_to_output(output: dict, field_extractions: dict) -> dict:
+        """
+        Merge human-corrected field values into the export dict.
+
+        po_data keeps original extracted values. Human corrections live in
+        field_extractions. This ensures corrected values appear in the download.
+
+        Only applies source_model == 'human' corrections.
+        Skips line_items.N pseudo-paths (handled separately via line_items list).
+        """
+        for path, ext in field_extractions.items():
+            if path.startswith('line_items.'):
+                continue
+            if ext.value is None:
+                continue
+            source = ext.source_model
+            if hasattr(source, 'value'):
+                source = source.value
+            if source != 'human':
+                continue
+
+            parts = path.split('.')
+            if len(parts) == 1:
+                output[parts[0]] = ext.value
+            elif len(parts) == 2:
+                section, key = parts
+                if section in output and isinstance(output[section], dict):
+                    output[section][key] = ext.value
+
+        return output
 
     # ------------------------------------------------------------------
     # CSV export
@@ -379,8 +418,9 @@ class ExportService:
           The receiver validates this to confirm the payload came from this system.
           Loosely coupled — if the receiver doesn't check the header, it still works.
         """
-        if not self._settings.webhooks_enabled:
-            logger.debug("Webhook not configured — skipping.")
+        url = (self._settings.webhook_url or "").strip()
+        if not url:
+            logger.debug("Webhook URL not configured — skipping fire_webhook.")
             return False
 
         if not result.is_ready_for_export:
