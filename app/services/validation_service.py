@@ -247,14 +247,43 @@ class ValidationService:
                     f"− discount({discount:.2f}) "
                     f"= {computed_grand:.2f}"
                 )
-                flags.append(ValidationFlag(
-                    rule="totals.grand_total_mismatch",
-                    message=(
+
+                # Detect partial payment scenario — common when a document shows
+                # "Balance Due" rather than "Grand Total". Payment language in
+                # payment_terms (e.g. "Paid (Jun 22, 2021)") is a strong signal.
+                payment_terms_lower = (po_data.payment_terms or "").lower()
+                is_partial_payment = any(
+                    kw in payment_terms_lower
+                    for kw in ("paid", "balance due", "balance", "partial", "deposit")
+                )
+
+                # Also check if the difference matches a round payment amount —
+                # a difference that's a clean round number (divisible by 1.0) is
+                # more likely a deliberate payment than an extraction error.
+                diff = abs(computed_grand - grand_total)
+                looks_like_payment = diff > 0.05 and diff == round(diff, 2)
+
+                if is_partial_payment or looks_like_payment:
+                    message = (
+                        f"Grand total ({grand_total:.2f}) differs from computed total "
+                        f"({components} = {computed_grand:.2f}) by {diff:.2f}. "
+                        f"This appears to be a partial payment — the declared amount "
+                        f"may reflect 'Balance Due' after a payment of {diff:.2f} "
+                        f"rather than the full order total. Verify before processing."
+                    )
+                    severity = "warning"
+                else:
+                    message = (
                         f"Computed grand total does not match declared grand total. "
                         f"{components}, but grand_total is {grand_total:.2f}. "
-                        f"Difference: {abs(computed_grand - grand_total):.2f}."
-                    ),
-                    severity="error",
+                        f"Difference: {diff:.2f}."
+                    )
+                    severity = "error"
+
+                flags.append(ValidationFlag(
+                    rule="totals.grand_total_mismatch",
+                    message=message,
+                    severity=severity,
                     affected_fields=[
                         "totals.grand_total", "totals.subtotal",
                         "totals.tax_amount", "totals.shipping", "totals.discount",

@@ -1036,6 +1036,14 @@ class OCRService:
             if not normalised_line:
                 continue
 
+            # Skip OCR lines much shorter than the target value.
+            # partial_ratio scores "1" as 100% against "1564 00" because "1"
+            # is a substring — this causes row numbers to match financial totals.
+            # Requiring the OCR line to be at least 50% the length of the target
+            # prevents single-digit row numbers from stealing financial field bboxes.
+            if len(normalised_line) < len(normalised_value) * 0.5:
+                continue
+
             score = fuzz.partial_ratio(normalised_value, normalised_line)
             if score > best_score:
                 best_score = score
