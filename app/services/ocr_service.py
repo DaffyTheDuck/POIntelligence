@@ -183,8 +183,52 @@ class _SuryaModels:
         with self._lock:
             if self._loaded:  # double-check after acquiring lock
                 return
+            # Force Ollama to release VRAM before surya loads.
+            # keep_alive=0 in the Ollama request tells it to unload after responding,
+            # but that unload is async — Celery can start the next task before Ollama
+            # finishes freeing VRAM. Explicitly calling the unload endpoint here makes
+            # the unload synchronous and blocks until Ollama confirms the model is gone.
+            self._unload_ollama_sync()
             self._load_sync()
             self._loaded = True
+
+    def _unload_ollama_sync(self) -> None:
+        """
+        Force Ollama to unload the current model from VRAM synchronously.
+
+        Ollama's documented unload mechanism: POST /api/generate with keep_alive=0
+        and an empty prompt. Ollama unloads the model and returns immediately.
+        This call blocks until the unload completes — safe to call from a thread.
+
+        No-op if Ollama isn't running or the model isn't loaded.
+        """
+        try:
+            import httpx as _httpx
+            settings = get_settings()
+            response = _httpx.post(
+                f"{settings.ollama_base_url}/api/generate",
+                json={
+                    "model":      settings.ollama_model,
+                    "prompt":     "",
+                    "keep_alive": 0,
+                },
+                timeout=15.0,
+            )
+            if response.status_code == 200:
+                logger.info(
+                    "Ollama model '%s' unloaded from VRAM before surya load.",
+                    settings.ollama_model,
+                )
+            # Also clear any PyTorch cached allocations from previous inferences
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+        except Exception as e:
+            # Not a fatal error — Ollama may not be running yet (e.g. first startup)
+            logger.debug("Ollama pre-unload skipped: %s", e)
 
     def _load_sync(self) -> None:
         """
@@ -568,11 +612,22 @@ class OCRService:
              Bboxes are approximate (strip-level) but good enough for matching.
         """
         if not _surya_models.ready:
-            logger.warning(
-                "surya predictors not loaded — skipping OCR for page %d.",
+            # Celery workers are separate processes — they don't run the FastAPI
+            # lifespan handler that pre-loads surya via warm_up(). Load here instead
+            # of skipping. This adds ~15s on the first Celery task per worker restart,
+            # but is the correct behaviour: OCR must run before extraction.
+            logger.info(
+                "surya not pre-loaded (Celery worker process) — loading now for page %d.",
                 page_number,
             )
-            return []
+            _surya_models._ensure_loaded_sync()
+            if not _surya_models.ready:
+                logger.error(
+                    "surya failed to load — skipping OCR for page %d. "
+                    "Check SURYA_DEVICE and VRAM availability.",
+                    page_number,
+                )
+                return []
 
         try:
             import io

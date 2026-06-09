@@ -175,8 +175,9 @@ job_store = JobStore()
 @celery_app.task(
     bind=True,
     name="po_intelligence.extract_document",
-    max_retries=1,
-    default_retry_delay=60,
+    max_retries=0,  # No retries — timeouts loop forever on a 4GB GPU.
+                    # A timed-out job marks as FAILED immediately so the
+                    # frontend stops polling and the GPU is freed for the next job.
 )
 def extract_document_task(
     self,
@@ -186,16 +187,18 @@ def extract_document_task(
     mime_type: str,
 ) -> None:
     """
-    Celery task: run the extraction pipeline for an email-ingested document.
+    Celery task: run the extraction pipeline for one document.
 
-    Called by EmailService._queue_attachment() after the attachment is saved.
-    Updates JobRecord status at each lifecycle stage.
+    Called by:
+      - EmailService._queue_attachment() for email-ingested documents
+      - upload_document() route for manual uploads
 
     asyncio.run() creates a fresh event loop for this thread.
-    Safe with CELERY_WORKER_CONCURRENCY=1 (one task at a time = no loop collision).
+    Safe with CELERY_WORKER_CONCURRENCY=1 (one task at a time = no GPU collision).
 
-    On failure: updates job to FAILED and retries once after 60s.
-    If the retry also fails: job stays FAILED, client is informed via polling.
+    On failure: marks job FAILED immediately, no retries.
+    SoftTimeLimitExceeded is caught explicitly — tasks exceeding
+    celery_task_timeout_seconds are marked FAILED and GPU is freed.
     """
     settings = get_settings()
 
@@ -246,26 +249,31 @@ def extract_document_task(
         )
 
     except Exception as exc:
-        logger.error(
-            "Task failed: job_id=%s, error=%s. Retrying if attempts remain.",
-            job_id, exc, exc_info=True,
-        )
+        from billiard.exceptions import SoftTimeLimitExceeded
+
+        if isinstance(exc, SoftTimeLimitExceeded):
+            # Task hit celery_task_timeout_seconds — GPU was busy too long.
+            # Mark FAILED immediately, no retry. Frees GPU for the next job.
+            error_msg = (
+                f"Extraction timed out after {settings.celery_task_timeout_seconds}s. "
+                f"The document may be too complex or the GPU was under memory pressure."
+            )
+            logger.error("Task timed out: job_id=%s", job_id)
+        else:
+            error_msg = str(exc)
+            logger.error(
+                "Task failed: job_id=%s, error=%s",
+                job_id, exc, exc_info=True,
+            )
 
         # ── Mark as FAILED ──────────────────────────────────────────────
         job = job.model_copy(update={
             "status": JobStatus.FAILED,
-            "error_message": str(exc),
+            "error_message": error_msg,
             "updated_at": datetime.now(timezone.utc),
         })
         job_store.update(job)
-
-        # Retry once after 60s (for transient failures like Ollama cold start)
-        try:
-            raise self.retry(exc=exc)
-        except self.MaxRetriesExceededError:
-            logger.error(
-                "Task max retries exceeded: job_id=%s. Job permanently failed.", job_id
-            )
+        logger.error("Task permanently failed: job_id=%s", job_id)
 
 
 # ---------------------------------------------------------------------------

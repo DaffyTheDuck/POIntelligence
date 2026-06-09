@@ -60,6 +60,14 @@ logger = logging.getLogger(__name__)
 # text-only models that struggle when OCR confidence is low.
 _QUALITY_THRESHOLD_FOR_LOCAL = 0.30
 
+
+# Fields that always escalate to Groq regardless of confidence score.
+# line_items: local models consistently misread table structure — confusing
+# row numbers with quantities, column headers with values. Groq with vision
+# gets tables right reliably. Since line items are the most financially
+# critical part of a PO, we don't risk it on the local model.
+_ALWAYS_GROQ_FIELDS = {"line_items"}
+
 # Health check cache TTL — 30s balances freshness vs latency.
 # A crashed Ollama will be detected within 30s. An HTTP health check takes ~300ms.
 _HEALTH_CACHE_TTL_SECONDS = 30.0
@@ -337,11 +345,13 @@ class RouterService:
         Fields with None value are included — they weren't found at all.
         """
         threshold = self._settings.confidence_threshold
-        return [
+        low_confidence = {
             field_path
             for field_path, extraction in output.field_extractions.items()
             if extraction.confidence < threshold
-        ]
+        }
+        forced = _ALWAYS_GROQ_FIELDS & set(output.field_extractions.keys())
+        return sorted(low_confidence | forced)
 
     # ------------------------------------------------------------------
     # Disagreement detection — architecture decision #4

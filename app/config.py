@@ -187,8 +187,12 @@ class Settings(BaseSettings):
         )
     )
     celery_task_timeout_seconds: int = Field(
-        default=300,
-        description="Hard timeout for a single Celery task. Kills zombie tasks."
+        default=600,
+        description=(
+            "Hard timeout for a single Celery task. Kills zombie tasks. "
+            "Set to 600 — qwen2.5vl:3b on GTX 1650 takes ~300s; "
+            "600 gives 2x headroom without letting tasks hang forever."
+        )
     )
 
     # -----------------------------------------------------------------------

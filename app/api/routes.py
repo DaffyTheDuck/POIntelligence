@@ -3,10 +3,15 @@ app/api/routes.py
 
 FastAPI router — HTTP surface for the PO Intelligence pipeline.
 
-Seven endpoints:
-  POST   /documents/upload          — synchronous upload + extraction
-  GET    /jobs/{job_id}             — poll async job status (email path)
+Endpoints:
+  POST   /documents/upload          — async upload: saves file, queues Celery task, returns job_id
+  GET    /jobs                      — list all jobs (upload + email ingestion)
+  GET    /jobs/{job_id}             — poll async job status
   POST   /corrections               — submit human field correction
+  POST   /approve-field             — one-click field approval
+  POST   /approve-all-fields        — bulk approve all flagged fields
+  POST   /approve                   — document-level sign-off
+  POST   /reject                    — reject document
   POST   /export                    — generate + download export file
   POST   /webhook/trigger           — manually fire ERP webhook
   GET    /documents/{document_id}/file — serve original document for UI overlay
@@ -15,8 +20,8 @@ Seven endpoints:
 Design rules enforced here:
   - No business logic — delegate immediately to services
   - Map service exceptions to HTTP status codes explicitly
-  - File uploads read fully into memory before passing to service
-    (acceptable for the configured max_upload_size_mb limit)
+  - Upload is async: file saved to disk, job queued, 202 returned immediately
+    Frontend polls GET /jobs/{job_id} every 3s until is_terminal=True
   - All response models declared so FastAPI generates accurate OpenAPI docs
 
 Mounted at /api/v1 in main.py.
@@ -34,15 +39,19 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
+from uuid import uuid4
+from pathlib import Path as _Path
+
 from app.models.po_models import (
     ApprovalRecord,
     ApprovalStatus,
     CorrectionRequest,
     CorrectionResponse,
     ExportRequest,
+    JobRecord,
+    JobStatus,
     JobStatusResponse,
     ModelSource,
-    UploadResponse,
 )
 from app.providers.groq_provider import GroqProvider
 from app.providers.ollama_provider import OllamaProvider
@@ -86,44 +95,69 @@ _EXPORT_MIME: dict = {
 # ===========================================================================
 
 
+# ---------------------------------------------------------------------------
+# Async upload response shape
+# ---------------------------------------------------------------------------
+
+class AsyncUploadResponse(BaseModel):
+    """Returned immediately after upload — client polls /jobs/{job_id} for result."""
+    job_id: str
+    document_id: str
+    status: str = "pending"
+    poll_url: str
+    message: str = "Document queued for extraction."
+
+
+# MIME type → file extension map for octet-stream fallback detection
+_EXT_MIME: dict = {
+    ".pdf":  "application/pdf",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png":  "image/png",
+    ".tiff": "image/tiff",
+    ".tif":  "image/tiff",
+    ".webp": "image/webp",
+}
+
+
 @router.post(
     "/documents/upload",
-    response_model=UploadResponse,
-    summary="Upload a PO document for synchronous extraction",
+    response_model=AsyncUploadResponse,
+    summary="Upload a PO document for async extraction",
     description=(
-        "Upload a PDF or image file. The pipeline runs synchronously and returns "
-        "the full ExtractionResult in the response. For high-volume ingestion, "
-        "use the IMAP email path and poll /jobs/{job_id} instead."
+        "Upload a PDF or image file. Returns a job_id immediately (202 Accepted). "
+        "Poll GET /jobs/{job_id} every 3 seconds until is_terminal=True. "
+        "When status='complete', the full ExtractionResult is in the response."
     ),
-    status_code=200,
+    status_code=202,
 )
 async def upload_document(
     file: UploadFile = File(
         ...,
         description="PDF or image file (JPEG, PNG, TIFF, WebP). Max size set by config.",
     ),
-    document_service: DocumentService = Depends(get_document_service),
-) -> UploadResponse:
+) -> JSONResponse:
     """
-    Synchronous upload and extraction endpoint.
+    Async upload endpoint — mirrors the email ingestion path.
 
     Flow:
-      1. Read file bytes from the multipart upload
-      2. Delegate to document_service (validates, saves, extracts)
-      3. Return UploadResponse with the full ExtractionResult
+      1. Read + validate file bytes
+      2. Save file to uploads/{document_id}/
+      3. Create JobRecord (status=PENDING) in job_store
+      4. Dispatch extract_document_task to Celery worker
+      5. Return {job_id, poll_url} immediately (202)
+
+    The Celery worker runs the full extraction pipeline (surya OCR → qwen2.5vl →
+    Groq fallback → validation) and updates the JobRecord to COMPLETE or FAILED.
 
     HTTP errors:
-      400 — invalid file (empty, unsupported format, magic bytes mismatch)
+      400 — empty file or unsupported format
       413 — file exceeds max_upload_size_mb
-      503 — both Ollama and Claude are unavailable
     """
-    # Read the full file into memory
-    # Acceptable given max_upload_size_mb ceiling enforced by document_service
     file_bytes = await file.read()
-
-    # Quick size pre-check before hitting document_service
-    # (document_service also checks, but this gives a cleaner 413 response)
     settings = get_settings()
+
+    # Size check
     if len(file_bytes) > settings.max_upload_size_bytes:
         raise HTTPException(
             status_code=413,
@@ -132,37 +166,79 @@ async def upload_document(
                 f"the {settings.max_upload_size_mb}MB limit."
             ),
         )
-
     if len(file_bytes) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
     declared_mime = file.content_type or "application/octet-stream"
     filename = file.filename or "document"
 
+    # Resolve octet-stream by extension (some browsers send this for PDFs/images)
+    if declared_mime == "application/octet-stream":
+        ext = _Path(filename).suffix.lower()
+        declared_mime = _EXT_MIME.get(ext, declared_mime)
+
+    if declared_mime not in settings.allowed_mime_types:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Unsupported file type '{declared_mime}'. "
+                f"Allowed: {settings.allowed_mime_types}"
+            ),
+        )
+
     logger.info(
         "Upload received: filename='%s', mime='%s', size=%d bytes",
         filename, declared_mime, len(file_bytes),
     )
 
-    try:
-        result = await document_service.process_upload(
-            file_bytes=file_bytes,
-            filename=filename,
-            declared_mime_type=declared_mime,
-        )
-    except ValueError as e:
-        # document_service raises ValueError for invalid files
-        # Determine whether it's a type error (415) or other validation (400)
-        msg = str(e)
-        status = 415 if "type" in msg.lower() or "format" in msg.lower() else 400
-        raise HTTPException(status_code=status, detail=msg)
-    except RuntimeError as e:
-        # Both providers unavailable
-        raise HTTPException(status_code=503, detail=str(e))
+    # Generate IDs + save to disk (same structure as email ingestion path)
+    document_id = str(uuid4())
+    job_id      = str(uuid4())
+    safe_name   = _Path(filename).name
+    doc_dir     = _Path(settings.upload_dir) / document_id
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    file_path   = doc_dir / safe_name
+    file_path.write_bytes(file_bytes)
 
-    return UploadResponse(
-        document_id=result.document_id,
-        result=result,
+    logger.info(
+        "File saved: job_id=%s, document_id=%s, path=%s",
+        job_id, document_id, file_path,
+    )
+
+    # Create job record — client can start polling immediately
+    job = JobRecord(
+        job_id=job_id,
+        document_id=document_id,
+        status=JobStatus.PENDING,
+        source_email="upload",   # sentinel: distinguishes upload vs email jobs
+        filename=safe_name,
+    )
+    job_store.save(job)
+
+    # Dispatch to Celery worker — uses same task as email ingestion path
+    from app.services.email_service import extract_document_task
+    extract_document_task.apply_async(
+        kwargs={
+            "job_id":       job_id,
+            "document_id":  document_id,
+            "file_path":    str(file_path),
+            "mime_type":    declared_mime,
+        },
+        task_id=job_id,  # Correlate Celery task ID with job_id for monitoring
+    )
+
+    logger.info("Celery task dispatched: job_id=%s filename='%s'", job_id, filename)
+
+    poll_url = f"/api/v1/jobs/{job_id}"
+    return JSONResponse(
+        content={
+            "job_id":       job_id,
+            "document_id":  document_id,
+            "status":       "pending",
+            "poll_url":     poll_url,
+            "message":      "Document queued for extraction. Poll poll_url for status.",
+        },
+        status_code=202,
     )
 
 

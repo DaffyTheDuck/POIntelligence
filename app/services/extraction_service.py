@@ -209,6 +209,12 @@ class ExtractionService:
         if not line_items_ext or not isinstance(line_items_ext.value, list):
             return field_extractions
 
+        def _unwrap(val):
+            """Unwrap {value, confidence} dict to plain value if needed."""
+            if isinstance(val, dict) and "value" in val:
+                return val["value"]
+            return val
+
         def _norm(v: str) -> str:
             """Strip currency/commas/spaces for loose numeric match."""
             return re.sub(r'[,$€£\s]', '', str(v)).lstrip('0') or '0'
@@ -232,11 +238,11 @@ class ExtractionService:
 
         for i, item in enumerate(line_items_ext.value):
             if isinstance(item, dict):
-                description = item.get('description')
-                qty         = item.get('quantity')
-                unit_price  = item.get('unit_price')
-                line_total  = item.get('line_total')
-                part_number = item.get('part_number')
+                description = _unwrap(item.get('description'))
+                qty         = _unwrap(item.get('quantity'))
+                unit_price  = _unwrap(item.get('unit_price'))
+                line_total  = _unwrap(item.get('line_total'))
+                part_number = _unwrap(item.get('part_number'))
             elif hasattr(item, 'description'):
                 description = item.description
                 qty         = getattr(item, 'quantity',    None)
@@ -256,6 +262,7 @@ class ExtractionService:
             # LLM spatial hint intentionally skipped — makes one Groq call per item
             # = 6+ extra calls = 90+ extra seconds. If exact+fuzzy can't find it, skip.
             desc_bbox, method = self._ocr._resolve_bounding_box(desc_str, all_lines)
+            logger.info("BBOX item %d: desc=%r bbox=%s lines=%d", i, desc_str[:30], desc_bbox, len(all_lines))
             if desc_bbox is None:
                 continue
 
@@ -298,7 +305,7 @@ class ExtractionService:
                 bounding_box=row_bbox,
                 flagged_for_review=False,
             )
-            logger.debug(
+            logger.info(
                 "Line item %d row bbox: '%s...' → %s (%d cols, x=[%.0f, %.0f])",
                 i, desc_str[:20], method.value, len(candidate_boxes),
                 merged_x0, merged_x1,
@@ -472,15 +479,29 @@ class ExtractionService:
                 warnings.append(f"line_items[{i}]: not a dict, skipping")
                 continue
 
-            # Coerce numeric fields — LLMs often return them as strings
+            # Coerce numeric fields — LLMs often return them as strings.
+            # Also unwrap {value, confidence} dicts — the model sometimes applies
+            # the top-level schema format to line item sub-fields incorrectly.
             for numeric_field in ("quantity", "unit_price", "line_total", "tax_rate"):
                 if numeric_field in item_data:
+                    val = item_data[numeric_field]
+                    # Unwrap {value, confidence} dict if present
+                    if isinstance(val, dict) and "value" in val:
+                        val = val["value"]
+                        item_data[numeric_field] = val
                     coerced, warning = _coerce_numeric(
-                        item_data[numeric_field], f"line_items[{i}].{numeric_field}"
+                        val, f"line_items[{i}].{numeric_field}"
                     )
                     if warning:
                         warnings.append(warning)
                     item_data[numeric_field] = coerced
+
+            # Also unwrap {value, confidence} dicts for string fields
+            for str_field in ("description", "unit", "part_number", "notes"):
+                if str_field in item_data:
+                    val = item_data[str_field]
+                    if isinstance(val, dict) and "value" in val:
+                        item_data[str_field] = val["value"]
 
             # Drop unknown keys to avoid Pydantic validation errors
             known_fields = {
